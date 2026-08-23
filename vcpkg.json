@@ -1,0 +1,26 @@
+{
+  "name": "quaton",
+  "version": "1.0.0",
+  "description": "A  tool for downloading some files.",
+  "homepage": "https://github.com/VisualTravel/Quaton",
+  "license": "GPL-3.0-only",
+  "dependencies": [
+    "zlib",
+    "protozero",
+    "nlohmann-json",
+    {
+      "name": "curl",
+      "features": [
+        "ssl"
+      ]
+    },
+    "zstd",
+    "xxhash",
+    "libzip",
+    {
+      "name": "sqlite3",
+      "default-features": true
+    }
+  ],
+  "builtin-baseline": "4334d8b4c8916018600212ab4dd4bbdc343065d1"
+}

@@ -1,0 +1,16 @@
+/.github
+/.vscode
+/build
+/build_static
+/build_static_triplet
+/build_client
+/packager
+/server
+/tests
+/build_dll
+/build_dll_static
+*.obj
+/_hpatch_test
+/third_party/HDiffPatch
+/_verify
+/prebuild
