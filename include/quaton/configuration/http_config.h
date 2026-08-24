@@ -12,13 +12,13 @@ namespace Quaton {
  * @brief HTTP client configuration structure
  */
 struct HttpConfig {
-  long timeout_ms = 30000;                   ///< Timeout in milliseconds
-  std::string user_agent = "Quaton/1.0.0";   ///< User agent string
-  int max_connections_per_server = 128;      ///< Max connections per server
-  std::vector<std::string> default_headers;  ///< Default request headers
-  bool follow_redirects = true;              ///< Follow HTTP redirects
-  bool ssl_verify_peer = true;               ///< Verify SSL peer certificate
-  bool ssl_verify_host = true;               ///< Verify SSL host
+  long timeout_ms = 30000;                      ///< Timeout in milliseconds
+  std::string user_agent = "Quaton/1.0.0-rc1";  ///< User agent string
+  int max_connections_per_server = 128;         ///< Max connections per server
+  std::vector<std::string> default_headers;     ///< Default request headers
+  bool follow_redirects = true;                 ///< Follow HTTP redirects
+  bool ssl_verify_peer = true;                  ///< Verify SSL peer certificate
+  bool ssl_verify_host = true;                  ///< Verify SSL host
 
   /**
    * @brief Create default HTTP configuration

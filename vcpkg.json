@@ -1,6 +1,6 @@
 {
   "name": "quaton",
-  "version": "1.0.0",
+  "version": "1.0.0-rc1",
   "description": "A  tool for downloading some files.",
   "homepage": "https://github.com/VisualTravel/Quaton",
   "license": "GPL-3.0-only",

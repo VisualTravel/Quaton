@@ -17,7 +17,7 @@ namespace Quaton {
 /**
  * @brief Quaton library version information
  */
-constexpr const char* kVersion = "1.0.0";
+constexpr const char* kVersion = "1.0.0-rc1";
 
 /**
  * @struct DownloadOptions
@@ -93,5 +93,12 @@ QUATON_API Quaton::ConfigRecord get_latest_config(
  */
 QUATON_API std::vector<Quaton::ManifestRecord> query_manifest_records(
     const std::string& package_id, const std::string& build_id = "");
+
+/**
+ * @brief Get multi-line build info string for display/diagnostics
+ *        (library version, platform/compiler, key dependency versions)
+ * @return Formatted build information
+ */
+QUATON_API std::string get_build_info();
 
 }  // namespace Quaton

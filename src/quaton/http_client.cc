@@ -79,7 +79,7 @@ HttpClient::HttpClient(int max_connections_per_server)
     : curl_(nullptr),
       headers_(nullptr),
       timeout_ms_(30000),
-      user_agent_("Quaton/1.0.0"),
+      user_agent_("Quaton/1.0.0-rc1"),
       max_connections_per_server_(max_connections_per_server),
       follow_redirects_(true),
       ssl_verify_peer_(true),
