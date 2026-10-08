@@ -398,6 +398,11 @@ void PatchDownloadService::Cancel() {
   apply_cv_.notify_all();
 }
 
+void PatchDownloadService::CancelAll() {
+  Cancel();
+  DownloadService::CancelAll();
+}
+
 // ========== Pipeline Workers ==========
 
 void PatchDownloadService::DownloadWorker() {

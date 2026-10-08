@@ -72,6 +72,36 @@ class ExitListenerThread {
   std::atomic<bool> stop_{false};
   std::thread thread_;
 };
+
+// Publishes the running download's cancel flag to the service so CancelAll()
+// can reach it, and withdraws it again on every exit path. Callers run one
+// Download() on a service at a time: a second concurrent call would republish
+// the slot and make the first download uncancellable while it runs.
+class ActiveCancelFlag {
+ public:
+  ActiveCancelFlag(std::mutex& mutex,
+                   std::shared_ptr<std::atomic<bool>>* slot,
+                   std::shared_ptr<std::atomic<bool>> flag)
+      : mutex_(mutex), slot_(slot), flag_(std::move(flag)) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    *slot_ = flag_;
+  }
+
+  ~ActiveCancelFlag() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (*slot_ == flag_) {
+      *slot_ = nullptr;
+    }
+  }
+
+  ActiveCancelFlag(const ActiveCancelFlag&) = delete;
+  ActiveCancelFlag& operator=(const ActiveCancelFlag&) = delete;
+
+ private:
+  std::mutex& mutex_;
+  std::shared_ptr<std::atomic<bool>>* slot_;
+  std::shared_ptr<std::atomic<bool>> flag_;
+};
 }  // namespace
 
 QUATON_NAMESPACE_BEGIN
@@ -110,6 +140,18 @@ void ChunkDownloadService::SetProgressCallback(ProgressCallback callback) {
   if (progress_tracker_) {
     progress_tracker_->set_callback(progress_callback_);
   }
+}
+
+void ChunkDownloadService::CancelAll() {
+  std::shared_ptr<std::atomic<bool>> cancel_flag;
+  {
+    std::lock_guard<std::mutex> lock(cancel_flag_mutex_);
+    cancel_flag = active_cancel_flag_;
+  }
+  if (cancel_flag) {
+    cancel_flag->store(true);
+  }
+  DownloadService::CancelAll();
 }
 
 // ============================================================================
@@ -197,6 +239,8 @@ std::future<int> ChunkDownloadService::Download(
           }
 
           auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
+          ActiveCancelFlag active_cancel(
+              cancel_flag_mutex_, &active_cancel_flag_, cancel_flag);
 
           progress_tracker_ = std::make_unique<ProgressTracker>(
               static_cast<int>(resources.size()),

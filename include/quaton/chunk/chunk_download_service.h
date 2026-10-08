@@ -93,6 +93,16 @@ class QUATON_API ChunkDownloadService : public DownloadService {
     return chunk_service_config_;
   }
 
+  /**
+   * @brief Stop the download currently running
+   *
+   * Sets the cancel flag of the active Download() call, so the worker threads
+   * abandon the remaining resources and the call returns a failure code. Only
+   * the manifest-URL overload is covered; the manifest-pair overload and
+   * Restore() keep their cancel flag internal.
+   */
+  void CancelAll() override;
+
   // ========== Download Operations (URL Mode) ==========
 
   /**
@@ -278,6 +288,10 @@ class QUATON_API ChunkDownloadService : public DownloadService {
   mutable std::mutex sessions_mutex_;
   std::unordered_map<std::string, SessionInfo> sessions_;
   std::atomic<uint64_t> session_counter_{0};
+
+  // Cancel flag of the running Download() call, empty while idle.
+  std::mutex cancel_flag_mutex_;
+  std::shared_ptr<std::atomic<bool>> active_cancel_flag_;
 };
 
 /**

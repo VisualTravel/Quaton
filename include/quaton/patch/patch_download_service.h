@@ -148,6 +148,13 @@ class QUATON_API PatchDownloadService : public DownloadService {
    */
   void Cancel();
 
+  /**
+   * @brief Cancel the pipeline through the base-class entry point
+   *
+   * Lets a caller that only knows DownloadService stop a running update.
+   */
+  void CancelAll() override;
+
   // ========== Legacy Session-based API ==========
 
   /**
