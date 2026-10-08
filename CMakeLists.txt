@@ -17,6 +17,7 @@ include(third_party/CMakeLists.txt)
 # Source files
 set(SOURCES
     src/quaton/quaton.cc
+    src/quaton/quaton_c.cc
     src/quaton/url.cc
     src/quaton/resource.cc
     src/quaton/configuration/path_config.cc
@@ -69,6 +70,7 @@ set(SOURCES
 set(HEADERS
     include/quaton/quaton_global.h
     include/quaton/quaton.h
+    include/quaton/quaton_c.h
     include/quaton/url.h
     include/quaton/resource.h
     include/quaton/configuration/configuration.h
