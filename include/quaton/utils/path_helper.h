@@ -52,6 +52,24 @@ class QUATON_API PathHelper {
   static std::string GetLogsDir();
 
   /**
+   * @brief Override the directory that holds all Quaton runtime state
+   *
+   * Lets a host keep its database, manifests and temporary files out of the
+   * shared default location. Must be called before the first download, because
+   * the database path is read when the database is opened; paths that were
+   * already passed to open files are not moved.
+   *
+   * @param data_root Absolute directory path, empty restores the default
+   */
+  static void SetDataRoot(const std::string& data_root);
+
+  /**
+   * @brief Get the directory currently holding Quaton runtime state
+   * @return Overridden data directory, or the platform default
+   */
+  static std::string GetDataRoot();
+
+  /**
    * @brief Recursively create directory
    * @param path Directory path
    * @return true if creation succeeds or already exists, false otherwise

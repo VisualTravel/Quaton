@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <mutex>
 
 #include "quaton/logger.h"
 
@@ -16,7 +17,14 @@
 
 QUATON_NAMESPACE_BEGIN
 
-std::string PathHelper::GetDataDir() {
+namespace {
+
+// Host-provided override of the runtime state directory. Guarded because a
+// host may set it while other threads already call the getters.
+std::mutex g_data_root_mutex;
+std::string g_data_root;
+
+std::string DefaultDataDir() {
 #ifdef QUATON_PLATFORM_WINDOWS
   const char* app_data = std::getenv("APPDATA");
   if (app_data) {
@@ -30,6 +38,27 @@ std::string PathHelper::GetDataDir() {
   }
   return "PremiX/Quaton";
 #endif
+}
+
+}  // namespace
+
+void PathHelper::SetDataRoot(const std::string& data_root) {
+  std::lock_guard<std::mutex> lock(g_data_root_mutex);
+  g_data_root = data_root;
+}
+
+std::string PathHelper::GetDataRoot() {
+  return GetDataDir();
+}
+
+std::string PathHelper::GetDataDir() {
+  {
+    std::lock_guard<std::mutex> lock(g_data_root_mutex);
+    if (!g_data_root.empty()) {
+      return g_data_root;
+    }
+  }
+  return DefaultDataDir();
 }
 
 std::string PathHelper::GetDatabaseDir() {
