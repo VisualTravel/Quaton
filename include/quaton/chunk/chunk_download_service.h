@@ -52,6 +52,8 @@ struct DownloadContext {
   std::shared_ptr<std::atomic<size_t>>
       completed_downloads;                               ///< Completed count
   std::shared_ptr<std::atomic<size_t>> total_downloads;  ///< Total count
+  /// Skip the local record fast path and transfer every task, as a repair does
+  bool force_download = false;
   TaskQueue* download_queue;          ///< Download queue pointer
   ProgressTracker* progress_tracker;  ///< Progress tracker pointer
 };
@@ -78,6 +80,40 @@ class QUATON_API ChunkDownloadService : public DownloadService {
   using AllCompletedCallback = std::function<void(bool all_success)>;
   using VerificationCallback =
       std::function<void(const std::string& file_name, bool verified)>;
+
+  // ========== Local integrity report ==========
+
+  /**
+   * @struct LocalFileIssue
+   * @brief One file that failed the local integrity check
+   */
+  struct LocalFileIssue {
+    std::string file_name;   ///< Manifest relative path
+    std::string checksum;    ///< MD5 the manifest lists for the file
+    int64_t size = 0;        ///< Size in bytes the manifest lists
+    int64_t actual_size = 0; ///< Size found on disk, 0 when unreadable
+    bool missing = false;    ///< true when the file is absent on disk
+  };
+
+  /**
+   * @struct LocalVerifyReport
+   * @brief Outcome of a read-only local integrity scan
+   */
+  struct LocalVerifyReport {
+    /// Input: cap for issues, 0 collects every failing file
+    size_t max_issues = 5000;
+
+    size_t total_files = 0;      ///< Files listed by the manifest
+    size_t valid_files = 0;      ///< Files matching size and checksum
+    size_t missing_files = 0;    ///< Files that are not on disk
+    size_t corrupted_files = 0;  ///< Files present but not matching
+    int64_t missing_bytes = 0;   ///< Manifest bytes of the missing files
+    int64_t corrupted_bytes = 0; ///< Manifest bytes of the corrupted files
+    bool issues_truncated = false;  ///< True when issues was capped
+    bool cancelled = false;         ///< True when the scan was cancelled
+
+    std::vector<LocalFileIssue> issues;  ///< Files that failed the check
+  };
 
   // ========== Initialization ==========
 
@@ -133,13 +169,45 @@ class QUATON_API ChunkDownloadService : public DownloadService {
                             const std::string& output_directory);
 
   /**
+   * @brief Check the installed tree against a manifest without downloading
+   *
+   * Compares every file the manifest lists with the local tree: a file is valid
+   * when it exists with the size and MD5 the manifest carries, which is what a
+   * download of that manifest verifies too. The manifest is the only reference,
+   * so a tree installed by other means, or one whose database records were
+   * lost, can be checked just as well.
+   *
+   * Nothing is written to the install directory and no record is created.
+   *
+   * @param manifest_pair Target manifest information pair
+   * @param output_directory Output directory (game install path)
+   * @param report Receives the outcome; report->max_issues caps report->issues
+   * @param cancel Optional flag the scan watches between files
+   * @return true when the tree could be scanned, false when the directory is
+   *         missing, the manifest could not be read or the scan was cancelled
+   */
+  bool Verify(const ChunkManifestPair& manifest_pair,
+              const std::string& output_directory,
+              LocalVerifyReport* report,
+              const std::shared_ptr<std::atomic<bool>>& cancel = nullptr);
+
+  /**
    * @brief Restore missing or corrupted files
+   *
+   * Downloads exactly the files Verify() reports and records them again.
+   *
    * @param manifest_pair Manifest information pair
    * @param output_directory Output directory (game install path)
+   * @param package Package name recorded for the repaired files, so it matches
+   *                what the download that installed the tree wrote
+   * @param cancel Optional flag the scan and the transfers watch
    * @return Future with result code (0 = success)
    */
   std::future<int> Restore(const ChunkManifestPair& manifest_pair,
-                           const std::string& output_directory);
+                           const std::string& output_directory,
+                           const std::string& package = "game",
+                           const std::shared_ptr<std::atomic<bool>>& cancel =
+                               nullptr);
 
   // ========== Download Operations (Resource Mode) ==========
 
@@ -235,6 +303,23 @@ class QUATON_API ChunkDownloadService : public DownloadService {
   std::string GenerateSessionId();
   void OnFileCompleted(const std::string& file_name, bool success);
   void CheckAllCompleted(const std::string& session_id);
+
+  /**
+   * @brief Enumerate a manifest and split its files into valid and invalid
+   *
+   * Shared by Verify() and Restore() so both apply identical rules.
+   *
+   * @param invalid Receives the resources that need (re)downloading, may be
+   *                null when the caller only wants the report
+   * @param report Receives the outcome, may be null
+   * @param cancel Optional flag the scan watches between files
+   * @return true when the manifest could be enumerated
+   */
+  bool CollectInvalidResources(const ChunkManifestPair& manifest_pair,
+                               const std::string& output_directory,
+                               std::vector<std::shared_ptr<Resource>>* invalid,
+                               LocalVerifyReport* report,
+                               const std::shared_ptr<std::atomic<bool>>& cancel);
 
   /**
    * @brief Process a single download task

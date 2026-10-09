@@ -1,5 +1,6 @@
 #include "quaton/chunk/chunk_download_service.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -407,94 +408,196 @@ std::future<int> ChunkDownloadService::Download(
       });
 }
 
+bool ChunkDownloadService::CollectInvalidResources(
+    const ChunkManifestPair& manifest_pair,
+    const std::string& output_directory,
+    std::vector<std::shared_ptr<Resource>>* invalid,
+    LocalVerifyReport* report,
+    const std::shared_ptr<std::atomic<bool>>& cancel) {
+  if (!fs::exists(output_directory)) {
+    LOG_ERROR("Output directory does not exist: %s", output_directory.c_str());
+    return false;
+  }
+
+  std::string manifest_output_dir = chunk_service_config_.manifest_output_dir;
+  if (manifest_output_dir.empty()) {
+    manifest_output_dir = PathHelper::GetManifestDir();
+  }
+
+  std::vector<std::shared_ptr<Resource>> resources;
+  int64_t update_size = 0;
+
+  // Fetching the manifest is the only network step of a scan, and that request
+  // is not retried anywhere below, so a dropped connection is retried here
+  // rather than reporting a healthy tree as uncheckable.
+  constexpr int kEnumerateAttempts = 3;
+  for (int attempt = 1; attempt <= kEnumerateAttempts; ++attempt) {
+    try {
+      auto fetched = Resource::retrieve_resources_from_manifests(
+          http_client_, manifest_pair, manifest_pair, std::string(),
+          manifest_output_dir);
+      resources = std::move(fetched.first);
+      update_size = fetched.second;
+      break;
+    } catch (const std::exception& e) {
+      if (attempt == kEnumerateAttempts) {
+        LOG_ERROR("Cannot enumerate the manifest: %s", e.what());
+        return false;
+      }
+      LOG_WARN("Manifest enumeration failed (attempt %d/%d): %s", attempt,
+               kEnumerateAttempts, e.what());
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+  }
+
+  LOG_INFO("Checking %zu files (%lld bytes) against %s", resources.size(),
+           static_cast<long long>(update_size), output_directory.c_str());
+
+  ProgressTracker tracker(static_cast<int>(resources.size()),
+                          OperationMode::kChunkVerify);
+  if (progress_callback_) {
+    tracker.set_callback(progress_callback_);
+  }
+
+  for (const auto& asset : resources) {
+    if (cancel && cancel->load()) {
+      LOG_INFO("Integrity check cancelled");
+      if (report != nullptr) {
+        report->cancelled = true;
+      }
+      return false;
+    }
+
+    if (!asset) {
+      continue;
+    }
+
+    // A manifest entry without a name has nothing to compare against, and the
+    // validity check rejects an empty path, so one broken entry must not turn
+    // the whole scan into a failure.
+    if (asset->name_.empty()) {
+      LOG_WARN("Ignoring a manifest entry without a name");
+      continue;
+    }
+
+    std::string asset_name_fixed = asset->name_;
+#ifdef _WIN32
+    std::replace(asset_name_fixed.begin(), asset_name_fixed.end(), '/', '\\');
+#endif
+    const fs::path full_path = fs::path(output_directory) / asset_name_fixed;
+
+    if (report != nullptr) {
+      report->total_files++;
+    }
+
+    std::error_code exists_error;
+    const bool exists = fs::exists(full_path, exists_error) && !exists_error;
+
+    std::error_code size_error;
+    const uintmax_t actual_size =
+        exists ? fs::file_size(full_path, size_error) : uintmax_t{0};
+    const bool size_matches =
+        exists && !size_error && static_cast<int64_t>(actual_size) == asset->size_;
+
+    // Reading the whole file is the expensive part, so a wrong size is settled
+    // without it.
+    std::string actual_md5;
+    if (size_matches) {
+      actual_md5 = ChecksumUtils::calculate_md5_file(full_path.string());
+    }
+    const bool valid =
+        size_matches && !actual_md5.empty() && actual_md5 == asset->hash_;
+
+    if (valid) {
+      tracker.update_current_file(asset->name_, FileProcessStage::kVerified);
+      if (report != nullptr) {
+        report->valid_files++;
+      }
+      tracker.increment_completed();
+      continue;
+    }
+
+    // Left at kNone so a failed file is not reported as verified.
+    tracker.update_current_file(asset->name_, FileProcessStage::kNone);
+
+    if (report != nullptr) {
+      if (exists) {
+        report->corrupted_files++;
+        report->corrupted_bytes += asset->size_;
+      } else {
+        report->missing_files++;
+        report->missing_bytes += asset->size_;
+      }
+
+      if (report->max_issues == 0 ||
+          report->issues.size() < report->max_issues) {
+        LocalFileIssue issue;
+        issue.file_name = asset->name_;
+        issue.checksum = asset->hash_;
+        issue.size = asset->size_;
+        issue.actual_size =
+            (exists && !size_error) ? static_cast<int64_t>(actual_size) : 0;
+        issue.missing = !exists;
+        report->issues.push_back(std::move(issue));
+      } else {
+        report->issues_truncated = true;
+      }
+    }
+
+    if (invalid != nullptr) {
+      invalid->push_back(asset);
+    }
+
+    tracker.increment_completed();
+  }
+
+  tracker.force_update();
+
+  if (report != nullptr) {
+    LOG_INFO(
+        "Integrity check: %zu files, %zu valid, %zu missing, %zu corrupted",
+        report->total_files, report->valid_files, report->missing_files,
+        report->corrupted_files);
+  } else {
+    LOG_INFO("Integrity check of %zu files finished", resources.size());
+  }
+  return true;
+}
+
+bool ChunkDownloadService::Verify(
+    const ChunkManifestPair& manifest_pair,
+    const std::string& output_directory,
+    LocalVerifyReport* report,
+    const std::shared_ptr<std::atomic<bool>>& cancel) {
+  if (report == nullptr) {
+    LOG_ERROR("Verify needs a report to write into");
+    return false;
+  }
+
+  // max_issues is an input field, so it has to survive the reset.
+  const size_t max_issues = report->max_issues;
+  *report = LocalVerifyReport{};
+  report->max_issues = max_issues;
+
+  return CollectInvalidResources(manifest_pair, output_directory, nullptr,
+                                 report, cancel);
+}
+
 std::future<int> ChunkDownloadService::Restore(
     const ChunkManifestPair& manifest_pair,
-    const std::string& output_directory) {
+    const std::string& output_directory,
+    const std::string& package,
+    const std::shared_ptr<std::atomic<bool>>& cancel) {
   return std::async(
-      std::launch::async, [this, manifest_pair, output_directory]() -> int {
+      std::launch::async,
+      [this, manifest_pair, output_directory, package, cancel]() -> int {
         try {
           LOG_INFO("Starting repair process...");
 
-          if (!fs::exists(output_directory)) {
-            LOG_ERROR("Output directory does not exist: %s",
-                      output_directory.c_str());
-            return -1;
-          }
-
-          int thread_count = chunk_service_config_.thread_count;
-          if (thread_count <= 0) {
-            thread_count =
-                static_cast<int>(std::thread::hardware_concurrency());
-            if (thread_count == 0) thread_count = 4;
-          }
-
-          std::string manifest_output_dir =
-              chunk_service_config_.manifest_output_dir;
-          if (manifest_output_dir.empty()) {
-            manifest_output_dir = PathHelper::GetManifestDir();
-          }
-
-          auto [resources, update_size] =
-              Resource::retrieve_resources_from_manifests(http_client_,
-                                                          manifest_pair,
-                                                          manifest_pair,
-                                                          "game",
-                                                          manifest_output_dir);
-
-          LOG_INFO("Found %zu resources in manifest", resources.size());
-
-          if (resources.empty()) {
-            LOG_INFO("No assets found in manifest");
-            return 0;
-          }
-
-          auto& db_manager = DatabaseManager::Instance();
-
           std::vector<std::shared_ptr<Resource>> assets_to_repair;
-          std::mutex console_mutex;
-
-          for (const auto& asset : resources) {
-            std::string asset_name_fixed = asset->name_;
-#ifdef _WIN32
-            std::replace(
-                asset_name_fixed.begin(), asset_name_fixed.end(), '/', '\\');
-#endif
-            fs::path output_path =
-                fs::path(output_directory) / asset_name_fixed;
-            std::string output_path_str = output_path.string();
-
-            std::string final_package_id = "game";
-            std::string final_build_id =
-                !manifest_pair.get_api_build_id().empty()
-                    ? manifest_pair.get_api_build_id()
-                    : manifest_pair.get_manifest_metadata().get_id();
-            std::string final_version = !manifest_pair.get_api_tag().empty()
-                                            ? manifest_pair.get_api_tag()
-                                            : final_build_id;
-            std::string final_depot_id =
-                !manifest_pair.get_api_category_id().empty()
-                    ? manifest_pair.get_api_category_id()
-                    : (final_package_id + "_depot");
-
-            FileValidationParams validation_params;
-            validation_params.file_path = asset->name_;
-            validation_params.file_checksum = asset->hash_;
-            validation_params.install_dir = output_directory;
-            validation_params.package_id = final_package_id;
-            validation_params.branch = "main";
-            validation_params.build_id = final_build_id;
-            validation_params.depot_id = final_depot_id;
-            validation_params.file_ver = final_version;
-
-            if (!db_manager.IsFileValid(validation_params)) {
-              assets_to_repair.push_back(asset);
-              std::lock_guard<std::mutex> lock(console_mutex);
-              if (!fs::exists(output_path_str)) {
-                LOG_WARN("Missing file detected: %s", asset->name_.c_str());
-              } else {
-                LOG_WARN("Corrupted file detected: %s", asset->name_.c_str());
-              }
-            }
+          if (!CollectInvalidResources(manifest_pair, output_directory,
+                                       &assets_to_repair, nullptr, cancel)) {
+            return -1;
           }
 
           if (assets_to_repair.empty()) {
@@ -503,6 +606,13 @@ std::future<int> ChunkDownloadService::Restore(
           }
 
           LOG_INFO("Found %zu files to repair", assets_to_repair.size());
+
+          int thread_count = chunk_service_config_.thread_count;
+          if (thread_count <= 0) {
+            thread_count =
+                static_cast<int>(std::thread::hardware_concurrency());
+            if (thread_count == 0) thread_count = 4;
+          }
 
           progress_tracker_ = std::make_unique<ProgressTracker>(
               static_cast<int>(assets_to_repair.size()),
@@ -513,7 +623,11 @@ std::future<int> ChunkDownloadService::Restore(
 
           DownloadContext context;
           context.output_directory = output_directory;
-          context.cancel_flag = std::make_shared<std::atomic<bool>>(false);
+          // A repair transfers what the manifest check rejected, so the local
+          // record fast path must not send it back to "already valid".
+          context.force_download = true;
+          context.cancel_flag = cancel ? cancel
+                                       : std::make_shared<std::atomic<bool>>(false);
           context.completed_downloads =
               std::make_shared<std::atomic<size_t>>(0);
           context.total_downloads =
@@ -529,9 +643,10 @@ std::future<int> ChunkDownloadService::Restore(
           ExitListenerThread exit_listener(context.cancel_flag);
 
           for (const auto& asset : assets_to_repair) {
-            download_queue.Enqueue([this, asset, &context, manifest_pair]() {
-              ProcessDownloadTask(asset, context, manifest_pair, "game");
-            });
+            download_queue.Enqueue(
+                [this, asset, &context, manifest_pair, package]() {
+                  ProcessDownloadTask(asset, context, manifest_pair, package);
+                });
           }
 
           WaitForDownloadCompletion(download_queue, context);
@@ -807,7 +922,7 @@ void ChunkDownloadService::ProcessDownloadTask(
     validation_params.depot_id = final_depot_id;
     validation_params.file_ver = final_version;
 
-    if (db_manager.IsFileValid(validation_params)) {
+    if (!context.force_download && db_manager.IsFileValid(validation_params)) {
       {
         std::lock_guard<std::mutex> lock(*context.console_mutex);
         (*context.skipped_downloads)++;

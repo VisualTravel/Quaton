@@ -133,25 +133,47 @@ typedef void(QUATON_C_CALL* quaton_progress_callback_c)(
     const char* progress_json, void* user_data);
 
 /**
- * @brief Start a download or update in the background.
+ * @brief Start an operation session in the background.
  *
  * @param request_json {"mode":"auto","api_base_url":"...","category_id":"...",
  *                      "install_dir":"...","previous_tag":"...",
  *                      "threads":0,"temp_dir":"...","manifest_dir":"...",
  *                      "verify_downloads":true,"silent":false}
  *
- *        mode        "auto"   full or incremental, whichever the index offers
- *                             for previous_tag (requires api_base_url,
- *                             category_id and install_dir)
- *                    "chunk"  plain chunk download of one category from
- *                             explicit manifest URLs
- *                    "patch"  patch-only update
+ *        mode        "auto"    full or incremental, whichever the index offers
+ *                              for previous_tag (requires api_base_url,
+ *                              category_id and install_dir)
+ *                    "chunk"   plain chunk download of one category from
+ *                              explicit manifest URLs
+ *                    "patch"   patch-only update
+ *                    "verify"  read-only integrity check of an installed
+ *                              category against its published manifest; the
+ *                              result becomes available through
+ *                              quaton_download_result_c once the session has
+ *                              finished, and the session itself succeeds even
+ *                              when files are reported
+ *                    "restore" re-download the files "verify" would report,
+ *                              fixing a damaged but present installation
  *        Full chunks additionally accept current_manifest_url,
  *        chunk_base_url, previous_manifest_url, output_dir and filter.
  *        Patches additionally accept patch_manifest_url, patch_manifest_md5,
  *        patch_manifest_compressed, patch_url_prefix, package_name,
  *        source_version and predownload_only; when they are absent the values
  *        are taken from the index.
+ *        Verify and restore locate the manifest through api_base_url,
+ *        category_id, branch and tag, or through explicit
+ *        current_manifest_url and chunk_base_url, and accept max_issues
+ *        (verify only, default 5000, 0 collects every failing file).
+ *
+ *        Nothing is compared against local records: the published manifest is
+ *        the only reference, so a tree that this library never downloaded, or
+ *        one whose records were removed, is checked just as well. filter is
+ *        used by restore only, as the package name the repaired files are
+ *        recorded under, and must match the download that installed the tree.
+ *
+ *        A verify or restore session can be cancelled through
+ *        quaton_download_cancel_c; the scan then stops after the file it is
+ *        working on.
  *
  * @param callback     Progress sink, may be NULL
  * @param user_data    Passed back to callback untouched
@@ -172,7 +194,40 @@ QUATON_C_API int32_t quaton_download_status_c(int64_t session_id,
                                               int32_t buffer_size);
 
 /**
+ * @brief Structured result of a finished session as JSON.
+ *
+ * Only "verify" produces one:
+ *
+ *   {"mode":"verify","install_dir":"...","total_files":6317,
+ *    "valid_files":6313,"missing_files":3,"corrupted_files":1,
+ *    "missing_bytes":4096,"corrupted_bytes":8192,
+ *    "issues_truncated":false,
+ *    "issues":[{"path":"a/b.webp","status":"missing","size":1234,
+ *               "actual_size":0,"checksum":"..."}]}
+ *
+ * status is "missing" when the file is absent and "corrupted" when it exists
+ * but differs from the manifest in size or checksum; size is what the manifest
+ * lists and actual_size what was found on disk. issues is capped by
+ * max_issues, and issues_truncated says whether it was. A "warnings" array is
+ * added when no file matched at all, which usually means install_dir holds
+ * another build.
+ *
+ * A session that failed or was cancelled publishes no report and returns {}.
+ * Every other mode returns an empty object too.
+ *
+ * @return Length of the JSON result excluding NUL, negative on failure. A
+ *         session that has not finished yet is rejected, so the result is
+ *         always complete.
+ */
+QUATON_C_API int32_t quaton_download_result_c(int64_t session_id,
+                                              char* buffer,
+                                              int32_t buffer_size);
+
+/**
  * @brief Ask a running session to stop; the session still has to be released.
+ *
+ * Downloads stop transferring, and a verify or restore scan stops after the
+ * file it is working on. A cancelled session reports the state "cancelled".
  */
 QUATON_C_API int32_t quaton_download_cancel_c(int64_t session_id);
 

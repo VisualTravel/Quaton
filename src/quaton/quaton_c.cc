@@ -454,10 +454,14 @@ struct Session {
   std::atomic<int> result_code{0};
   std::atomic<bool> cancel_requested{false};
 
-  std::mutex mutex;  // guards message, progress and service
+  std::mutex mutex;  // guards message, progress, result, service and cancel
   std::string message;
   json progress = json::object();
+  json result = json::object();
   std::shared_ptr<Quaton::DownloadService> service;
+  // Published by the workers that scan the disk, because those go through
+  // neither the scheduler nor a session cancel flag of their own.
+  std::shared_ptr<std::atomic<bool>> cancel_flag;
 
   std::mutex join_mutex;  // guards worker/joined
   std::thread worker;
@@ -509,12 +513,50 @@ std::shared_ptr<Session> TakeSession(int64_t id) {
   return session;
 }
 
+// The workers that scan the install directory do not run through the scheduler,
+// so they publish their own flag for quaton_download_cancel_c to set.
+std::shared_ptr<std::atomic<bool>> PublishCancelFlag(
+    const std::shared_ptr<Session>& session) {
+  auto flag = std::make_shared<std::atomic<bool>>(false);
+  std::lock_guard<std::mutex> lock(session->mutex);
+  // A cancellation that arrived while the session was still preparing must not
+  // be lost, because nothing looks at cancel_requested again afterwards.
+  flag->store(session->cancel_requested.load());
+  session->cancel_flag = flag;
+  return flag;
+}
+
+// Stops a session wherever it currently is: a download through the service, a
+// scan through the flag the scan published.
+void RequestSessionCancel(const std::shared_ptr<Session>& session) {
+  session->cancel_requested.store(true);
+  // Cancelling reaches into the service, which takes its own locks, so the
+  // session must not be held while doing it.
+  std::shared_ptr<Quaton::DownloadService> service;
+  std::shared_ptr<std::atomic<bool>> cancel_flag;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    service = session->service;
+    cancel_flag = session->cancel_flag;
+  }
+  if (cancel_flag) {
+    cancel_flag->store(true);
+  }
+  if (service) {
+    service->CancelAll();
+  }
+}
+
 // ============================================================================
 // Progress reporting
 // ============================================================================
 
 const char* OperationModeName(Quaton::OperationMode mode) {
   switch (mode) {
+    case Quaton::OperationMode::kChunkVerify:
+      // Same name as the session mode and the report mode, so a host can match
+      // progress to the result without a second mapping.
+      return "verify";
     case Quaton::OperationMode::kPatchUpdate:
       return "patch_update";
     case Quaton::OperationMode::kPatchPredownload:
@@ -569,8 +611,9 @@ void ReportProgress(const std::shared_ptr<Session>& session,
 
 // Holds the running service for the duration of a download. The progress
 // callback captures the session, so the service would keep the session alive in
-// return; clearing the callback and the session's reference is what breaks that
-// cycle, and it has to happen on every exit path, including early failures.
+// return; dropping the session's reference here destroys the service, which in
+// turn destroys the callback that captured the session, and that is what breaks
+// the cycle. It has to happen on every exit path.
 class ServiceOwnership {
  public:
   ServiceOwnership(const std::shared_ptr<Session>& session,
@@ -595,25 +638,39 @@ class ServiceOwnership {
 };
 
 // ============================================================================
-// Download workers
+// Shared request plumbing for the download, verify and restore workers
 // ============================================================================
 
-int RunChunkDownload(const std::shared_ptr<Session>& session,
-                     const json& request,
-                     std::string* error) {
-  const std::string manifest_url = GetString(request, "current_manifest_url");
-  const std::string chunk_url = GetString(request, "chunk_base_url");
+// The install directory accepts the output_dir alias so a host can use either
+// name for the same thing.
+std::string RequestInstallDir(const json& request) {
   std::string install_dir = GetString(request, "install_dir");
   if (install_dir.empty()) {
     install_dir = GetString(request, "output_dir");
   }
-  if (manifest_url.empty() || chunk_url.empty() || install_dir.empty()) {
-    *error =
-        "chunk mode requires current_manifest_url, chunk_base_url and "
-        "install_dir";
-    return -1;
-  }
+  return install_dir;
+}
 
+// Verification and repair read a tree that a download already installed, so a
+// missing directory is a caller mistake worth naming rather than a bare -1.
+bool RequireInstallDir(const std::string& install_dir,
+                       const char* mode,
+                       std::string* error) {
+  if (install_dir.empty()) {
+    *error = std::string(mode) + " mode requires install_dir";
+    return false;
+  }
+  std::error_code code;
+  if (!std::filesystem::is_directory(install_dir, code)) {
+    *error = std::string(mode) +
+             " mode needs an existing install_dir: " + install_dir;
+    return false;
+  }
+  return true;
+}
+
+Quaton::ChunkServiceConfig BuildChunkConfig(const json& request,
+                                            const std::string& install_dir) {
   Quaton::ChunkServiceConfig config;
   config.thread_count = GetInt(request, "threads", 0);
   config.max_http_handles = GetInt(request, "max_http_handles", 128);
@@ -623,17 +680,145 @@ int RunChunkDownload(const std::shared_ptr<Session>& session,
   config.install_path = install_dir;
   config.temp_path = GetString(request, "temp_dir");
   config.manifest_output_dir = GetString(request, "manifest_dir");
+  return config;
+}
+
+// A manifest file URL carries no integrity metadata, so checksum and size are
+// placeholders; enumeration only needs the base URL and the file name.
+bool MakeManifestPair(const std::string& manifest_url,
+                      const std::string& chunk_base_url,
+                      Quaton::ChunkManifestPair* manifest_pair,
+                      std::string* error) {
+  const auto slash = manifest_url.find_last_of('/');
+  if (slash == std::string::npos || slash + 1 >= manifest_url.size()) {
+    *error = "invalid manifest URL: " + manifest_url;
+    return false;
+  }
+
+  manifest_pair->set_manifest_metadata(
+      Quaton::ManifestMetadata(manifest_url.substr(0, slash),
+                               "url",
+                               manifest_url.substr(slash + 1),
+                               /*use_compression=*/true,
+                               1,
+                               0));
+  manifest_pair->get_chunk_info().set_base_url(chunk_base_url);
+  return true;
+}
+
+// Resolves the manifest a verification or a repair works on: either the URLs
+// come straight from the request, or they are taken from the index for one
+// category. Both paths yield the same manifest identity a download of that
+// category used, which is what makes the recorded file keys comparable.
+bool ResolveManifestTarget(const json& request,
+                           std::string* manifest_url,
+                           std::string* chunk_base_url,
+                           std::string* error) {
+  *manifest_url = GetString(request, "current_manifest_url");
+  *chunk_base_url = GetString(request, "chunk_base_url");
+  if (!manifest_url->empty() && !chunk_base_url->empty()) {
+    return true;
+  }
+
+  const std::string category_id = GetString(request, "category_id");
+  const std::string api_base_url = GetString(request, "api_base_url");
+  if (api_base_url.empty() || category_id.empty()) {
+    *error =
+        "api_base_url and category_id, or current_manifest_url and "
+        "chunk_base_url, are required";
+    return false;
+  }
+
+  IndexInfo index;
+  if (!QueryIndex(api_base_url,
+                  GetString(request, "branch", "main"),
+                  GetString(request, "tag"),
+                  std::string(),
+                  &index,
+                  error)) {
+    return false;
+  }
+
+  const CategoryInfo* category = index.Find(category_id);
+  if (category == nullptr) {
+    *error = "category not present in the index: " + category_id;
+    return false;
+  }
+  if (manifest_url->empty()) {
+    *manifest_url = category->manifest_url;
+  }
+  if (chunk_base_url->empty()) {
+    *chunk_base_url = category->chunk_url_prefix;
+  }
+  return true;
+}
+
+json VerifyReportToJson(
+    const Quaton::ChunkDownloadService::LocalVerifyReport& report,
+    const std::string& install_dir,
+    const std::string& category_id) {
+  json issues = json::array();
+  for (const auto& issue : report.issues) {
+    issues.push_back({{"path", issue.file_name},
+                      {"status", issue.missing ? "missing" : "corrupted"},
+                      {"size", issue.size},
+                      {"actual_size", issue.actual_size},
+                      {"checksum", issue.checksum}});
+  }
+
+  json result = {{"mode", "verify"},
+                 {"install_dir", install_dir},
+                 {"total_files", report.total_files},
+                 {"valid_files", report.valid_files},
+                 {"missing_files", report.missing_files},
+                 {"corrupted_files", report.corrupted_files},
+                 {"missing_bytes", report.missing_bytes},
+                 {"corrupted_bytes", report.corrupted_bytes},
+                 {"issues_truncated", report.issues_truncated},
+                 {"issues", std::move(issues)}};
+  if (!category_id.empty()) {
+    result["category_id"] = category_id;
+  }
+  // Not a single file matched the manifest, which usually means the directory
+  // belongs to another build rather than that every file is damaged.
+  if (report.total_files > 0 && report.valid_files == 0) {
+    result["warnings"] = json::array(
+        {"no file matched the manifest: install_dir does not hold the files "
+         "this manifest describes"});
+  }
+  return result;
+}
+
+// ============================================================================
+// Download workers
+// ============================================================================
+
+int RunChunkDownload(const std::shared_ptr<Session>& session,
+                     const json& request,
+                     std::string* error) {
+  const std::string manifest_url = GetString(request, "current_manifest_url");
+  const std::string chunk_url = GetString(request, "chunk_base_url");
+  const std::string install_dir = RequestInstallDir(request);
+  if (manifest_url.empty() || chunk_url.empty() || install_dir.empty()) {
+    *error =
+        "chunk mode requires current_manifest_url, chunk_base_url and "
+        "install_dir";
+    return -1;
+  }
 
   auto service = std::make_shared<Quaton::ChunkDownloadService>();
-  ServiceOwnership ownership(session, service);
   service->SetProgressCallback([session](const Quaton::ProgressInfo& info) {
     ReportProgress(session, info);
   });
 
-  if (!service->Initialize(config)) {
+  if (!service->Initialize(BuildChunkConfig(request, install_dir))) {
     *error = "chunk download service failed to initialize";
     return -1;
   }
+
+  // Published only once the service is initialized, so that a concurrent cancel
+  // cannot reach into a half-built scheduler.
+  ServiceOwnership ownership(session, service);
 
   const int code = service
                        ->Download(GetString(request, "previous_manifest_url"),
@@ -648,13 +833,128 @@ int RunChunkDownload(const std::shared_ptr<Session>& session,
   return code;
 }
 
+// Reads the installed tree back against the manifest and stores the report in
+// the session. Nothing is written to the install directory, so a tree with
+// problems still counts as a finished scan.
+int RunChunkVerify(const std::shared_ptr<Session>& session,
+                   const json& request,
+                   std::string* error) {
+  const std::string install_dir = RequestInstallDir(request);
+  if (!RequireInstallDir(install_dir, "verify", error)) {
+    return -1;
+  }
+
+  std::string manifest_url;
+  std::string chunk_base_url;
+  if (!ResolveManifestTarget(request, &manifest_url, &chunk_base_url, error)) {
+    return -1;
+  }
+
+  Quaton::ChunkManifestPair manifest_pair;
+  if (!MakeManifestPair(manifest_url, chunk_base_url, &manifest_pair, error)) {
+    return -1;
+  }
+
+  auto service = std::make_shared<Quaton::ChunkDownloadService>();
+  service->SetProgressCallback([session](const Quaton::ProgressInfo& info) {
+    ReportProgress(session, info);
+  });
+
+  if (!service->Initialize(BuildChunkConfig(request, install_dir))) {
+    *error = "verify service failed to initialize";
+    return -1;
+  }
+
+  // The service is published only once it is initialized, so a concurrent
+  // cancel cannot reach into a half-built scheduler.
+  ServiceOwnership ownership(session, service);
+
+  Quaton::ChunkDownloadService::LocalVerifyReport report;
+  const int max_issues = GetInt(request, "max_issues", 5000);
+  if (max_issues < 0) {
+    *error = "max_issues must not be negative";
+    return -1;
+  }
+  report.max_issues = static_cast<size_t>(max_issues);
+
+  if (!service->Verify(manifest_pair, install_dir, &report,
+                       PublishCancelFlag(session))) {
+    if (report.cancelled) {
+      // A cancelled scan has no report to publish and must not surface as a
+      // failure with a misleading reason.
+      session->cancel_requested.store(true);
+      *error = "integrity check cancelled";
+    } else {
+      *error = "cannot check the install directory";
+    }
+    return -1;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->result = VerifyReportToJson(report, install_dir,
+                                         GetString(request, "category_id"));
+  }
+  return 0;
+}
+
+// Downloads whatever the same check reports as missing or corrupted.
+int RunRestore(const std::shared_ptr<Session>& session,
+               const json& request,
+               std::string* error) {
+  const std::string install_dir = RequestInstallDir(request);
+  if (!RequireInstallDir(install_dir, "restore", error)) {
+    return -1;
+  }
+
+  std::string manifest_url;
+  std::string chunk_base_url;
+  if (!ResolveManifestTarget(request, &manifest_url, &chunk_base_url, error)) {
+    return -1;
+  }
+
+  Quaton::ChunkManifestPair manifest_pair;
+  if (!MakeManifestPair(manifest_url, chunk_base_url, &manifest_pair, error)) {
+    return -1;
+  }
+
+  auto service = std::make_shared<Quaton::ChunkDownloadService>();
+  service->SetProgressCallback([session](const Quaton::ProgressInfo& info) {
+    ReportProgress(session, info);
+  });
+
+  if (!service->Initialize(BuildChunkConfig(request, install_dir))) {
+    *error = "restore service failed to initialize";
+    return -1;
+  }
+
+  // Published only after Initialize, for the same reason as in verify.
+  ServiceOwnership ownership(session, service);
+
+  // filter is the package identity the download used, and the repaired files
+  // are recorded under the same name.
+  const std::string package = GetString(request, "filter");
+  const auto cancel_flag = PublishCancelFlag(session);
+  const int code =
+      service
+          ->Restore(manifest_pair, install_dir,
+                    package.empty() ? "game" : package, cancel_flag)
+          .get();
+  if (code != 0) {
+    if (cancel_flag->load()) {
+      session->cancel_requested.store(true);
+      *error = "repair cancelled";
+    } else {
+      *error = "restore returned " + std::to_string(code);
+    }
+  }
+  return code;
+}
+
 int RunPatchDownload(const std::shared_ptr<Session>& session,
                      const json& request,
                      std::string* error) {
-  std::string install_dir = GetString(request, "install_dir");
-  if (install_dir.empty()) {
-    install_dir = GetString(request, "output_dir");
-  }
+  std::string install_dir = RequestInstallDir(request);
   const std::string package_name =
       GetString(request, "category_id", GetString(request, "package_name"));
   std::string manifest_url = GetString(request, "patch_manifest_url");
@@ -731,7 +1031,6 @@ int RunPatchDownload(const std::shared_ptr<Session>& session,
   config.manager_config.target_version = GetString(request, "tag");
 
   auto service = std::make_shared<Quaton::PatchDownloadService>();
-  ServiceOwnership ownership(session, service);
   service->SetProgressCallback([session](const Quaton::ProgressInfo& info) {
     ReportProgress(session, info);
   });
@@ -740,6 +1039,10 @@ int RunPatchDownload(const std::shared_ptr<Session>& session,
     *error = "patch download service failed to initialize";
     return -1;
   }
+
+  // Published only once the service is initialized, so that a concurrent cancel
+  // cannot reach into a half-built scheduler.
+  ServiceOwnership ownership(session, service);
 
   try {
     auto manifest = Quaton::PatchManifestProcessor::download_and_parse_manifest(
@@ -841,6 +1144,10 @@ void RunSession(const std::shared_ptr<Session>& session, json request) {
       code = RunPatchDownload(session, request, &error);
     } else if (mode == "chunk") {
       code = RunChunkDownload(session, request, &error);
+    } else if (mode == "verify") {
+      code = RunChunkVerify(session, request, &error);
+    } else if (mode == "restore") {
+      code = RunRestore(session, request, &error);
     } else {
       error = "unsupported mode: " + mode;
     }
@@ -972,15 +1279,7 @@ int32_t quaton_shutdown_c(void) {
           g_sessions.clear();
         }
         for (const auto& session : sessions) {
-          session->cancel_requested.store(true);
-          std::shared_ptr<Quaton::DownloadService> service;
-          {
-            std::lock_guard<std::mutex> lock(session->mutex);
-            service = session->service;
-          }
-          if (service) {
-            service->CancelAll();
-          }
+          RequestSessionCancel(session);
         }
         for (const auto& session : sessions) {
           std::lock_guard<std::mutex> lock(session->join_mutex);
@@ -1081,6 +1380,30 @@ int32_t quaton_download_status_c(int64_t session_id,
       "quaton_download_status");
 }
 
+int32_t quaton_download_result_c(int64_t session_id,
+                                 char* buffer,
+                                 int32_t buffer_size) {
+  ClearLastError();
+  return Guard(
+      [&]() {
+        const auto session = FindSession(session_id);
+        if (session == nullptr) {
+          return Fail("unknown session: " + std::to_string(session_id));
+        }
+        if (session->state.load() == kRunning) {
+          return Fail("session is still running: " + std::to_string(session_id));
+        }
+
+        json result;
+        {
+          std::lock_guard<std::mutex> lock(session->mutex);
+          result = session->result;
+        }
+        return CopyToBuffer(DumpJson(result), buffer, buffer_size);
+      },
+      "quaton_download_result");
+}
+
 int32_t quaton_download_cancel_c(int64_t session_id) {
   ClearLastError();
   return Guard(
@@ -1089,17 +1412,7 @@ int32_t quaton_download_cancel_c(int64_t session_id) {
         if (session == nullptr) {
           return Fail("unknown session: " + std::to_string(session_id));
         }
-        session->cancel_requested.store(true);
-        // Cancelling reaches into the service, which takes its own locks, so
-        // the session must not be held while doing it.
-        std::shared_ptr<Quaton::DownloadService> service;
-        {
-          std::lock_guard<std::mutex> lock(session->mutex);
-          service = session->service;
-        }
-        if (service) {
-          service->CancelAll();
-        }
+        RequestSessionCancel(session);
         return 0;
       },
       "quaton_download_cancel");

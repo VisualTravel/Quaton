@@ -28,10 +28,11 @@ enum class FileProcessStage {
  * @brief Operation mode for progress tracking
  */
 enum class OperationMode {
-  kChunkDownload,     ///< Chunk-based download
-  kPatchUpdate,       ///< Patch-based update (download and apply)
-  kPatchPredownload,  ///< Patch-based predownload (download only)
-  kPatchLocalInstall  ///< Apply patches from local storage
+  kChunkDownload = 0,      ///< Chunk-based download
+  kPatchUpdate = 1,        ///< Patch-based update (download and apply)
+  kPatchPredownload = 2,   ///< Patch-based predownload (download only)
+  kPatchLocalInstall = 3,  ///< Apply patches from local storage
+  kChunkVerify = 4         ///< Local integrity scan of an installed tree
 };
 
 /**
