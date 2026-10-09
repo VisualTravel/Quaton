@@ -17,7 +17,7 @@ namespace Quaton {
 /**
  * @brief Quaton library version information
  */
-constexpr const char* kVersion = "1.0.0-rc1";
+constexpr const char* kVersion = "1.0.0-rc2";
 
 /**
  * @struct DownloadOptions

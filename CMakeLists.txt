@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(Quaton VERSION 0.1.0 LANGUAGES C CXX)
+# CMake only accepts dotted numbers, so the release suffix ("1.0.0-rc2") is
+# carried by Quaton::kVersion; this numeric version drives SOVERSION and the
+# installed file name.
+project(Quaton VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
