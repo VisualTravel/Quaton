@@ -8,12 +8,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -935,9 +937,22 @@ int32_t quaton_init_c(const char* config_json) {
         // Logger and LogLevel live in the global namespace (quaton/logger.h).
         ::Logger::setLogLevel(static_cast<LogLevel>(log_level));
 
-        const std::string root = Quaton::PathHelper::GetDataRoot();
-        if (!Quaton::PathHelper::CreateDirectoryRecursive(root)) {
-          return Fail("cannot create data directory: " + root);
+        // The library writes into these directories but does not always create
+        // them, so a host that points data_dir at a fresh folder would lose the
+        // manifest bookkeeping files. Creating the sub directories also creates
+        // the data root itself.
+        const std::string directories[] = {Quaton::PathHelper::GetDatabaseDir(),
+                                           Quaton::PathHelper::GetManifestDir(),
+                                           Quaton::PathHelper::GetTempDir()};
+        for (const std::string& directory : directories) {
+          // Only reject the call when the directory is really unusable: the
+          // helper reports failure for some path shapes (UNC shares, for
+          // example) even though the directory is already there.
+          std::error_code error;
+          if (!Quaton::PathHelper::CreateDirectoryRecursive(directory) &&
+              !std::filesystem::is_directory(directory, error)) {
+            return Fail("cannot create data directory: " + directory);
+          }
         }
         return 0;
       },

@@ -82,13 +82,16 @@ QUATON_C_API int32_t quaton_last_error_c(char* buffer, int32_t buffer_size);
  * @brief Initialize the library for this process.
  *
  * Validates the request before it changes any global state, so a rejected call
- * leaves the library as it was.
+ * leaves the library as it was. Failures while creating the data directories
+ * can still leave data_dir and log_level applied.
  *
  * @param config_json {"data_dir":"...","log_level":2}
- *        data_dir  root for database, manifests, temp and log files; when
- *                  absent the platform default is used. Must be set before
- *                  the first download, because it is read when the database is
- *                  opened.
+ *        data_dir  root for database, manifests and temp files; when absent the
+ *                  platform default is used. Must be set before the first
+ *                  download, because it is read when the database is opened.
+ *                  The log file is not affected: the logger binds its path when
+ *                  the module loads and always writes to the default log
+ *                  directory.
  *        log_level 0 trace .. 5 fatal, defaults to info.
  * @return 0 on success, negative on failure
  */
