@@ -4,6 +4,21 @@
 
 namespace Quaton {
 
+DecompressionMeter& DecompressionMeter::instance() {
+  static DecompressionMeter meter;
+  return meter;
+}
+
+void DecompressionMeter::AddBytes(int64_t bytes) noexcept {
+  if (bytes > 0) {
+    total_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+}
+
+int64_t DecompressionMeter::TotalBytes() const noexcept {
+  return total_bytes_.load(std::memory_order_relaxed);
+}
+
 ProgressTracker::ProgressTracker(int total_files, OperationMode mode)
     : total_files_(total_files),
       completed_files_(0),
@@ -11,10 +26,19 @@ ProgressTracker::ProgressTracker(int total_files, OperationMode mode)
       bytes_total_(0),
       operation_mode_(mode),
       last_bytes_downloaded_(0),
-      current_speed_(0.0) {
+      current_speed_(0.0),
+      last_decompressed_bytes_(0),
+      decompression_speed_(0.0) {
   start_time_ = std::chrono::steady_clock::now();
   last_callback_time_ = start_time_;
   last_speed_update_ = start_time_;
+  last_decompression_update_ = start_time_;
+  // Bytes another session decompressed before this tracker existed are not part
+  // of this session's average.
+  start_decompressed_bytes_ = DecompressionMeter::instance().TotalBytes();
+  last_decompressed_bytes_ = start_decompressed_bytes_;
+  decompression_start_ = start_time_;
+  decompression_window_closed_ = false;
 }
 
 void ProgressTracker::set_callback(ProgressCallback callback) {
@@ -115,6 +139,10 @@ ProgressInfo ProgressTracker::get_progress() const {
   // Download speed (convert to MB/s)
   info.download_speed = current_speed_ / (1024.0 * 1024.0);
 
+  // Decompression statistics
+  info.decompressed_bytes = DecompressionMeter::instance().TotalBytes();
+  info.decompression_speed = sample_decompression_speed() / (1024.0 * 1024.0);
+
   // Estimated time
   if (current_speed_ > 0 && bytes_total_.load() > 0) {
     int64_t remaining_bytes = bytes_total_.load() - bytes_downloaded_.load();
@@ -148,6 +176,51 @@ void ProgressTracker::reset() {
   start_time_ = std::chrono::steady_clock::now();
   last_callback_time_ = start_time_;
   last_speed_update_ = start_time_;
+
+  {
+    std::lock_guard<std::mutex> lock(decompression_mutex_);
+    start_decompressed_bytes_ = DecompressionMeter::instance().TotalBytes();
+    last_decompressed_bytes_ = start_decompressed_bytes_;
+    decompression_start_ = start_time_;
+    last_decompression_update_ = start_time_;
+    decompression_speed_ = 0.0;
+    decompression_window_closed_ = false;
+  }
+}
+
+double ProgressTracker::sample_decompression_speed() const {
+  const int64_t total = DecompressionMeter::instance().TotalBytes();
+  const auto now = std::chrono::steady_clock::now();
+
+  std::lock_guard<std::mutex> lock(decompression_mutex_);
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now - last_decompression_update_)
+                              .count();
+  if (elapsed_ms >= 1000) {
+    const int64_t delta = total - last_decompressed_bytes_;
+    decompression_speed_ = delta > 0 ? (delta * 1000.0) / elapsed_ms : 0.0;
+    last_decompressed_bytes_ = total;
+    last_decompression_update_ = now;
+    decompression_window_closed_ = true;
+    return decompression_speed_;
+  }
+  if (decompression_window_closed_) {
+    // The measured window wins, including a genuine zero once nothing is being
+    // decompressed any more.
+    return decompression_speed_;
+  }
+
+  // No window has closed yet, so report the average of the transfer so far;
+  // otherwise a short download would never show a decompression speed at all.
+  const auto since_start_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - decompression_start_)
+          .count();
+  if (since_start_ms < 200) {
+    return 0.0;
+  }
+  const int64_t since_start = total - start_decompressed_bytes_;
+  return since_start > 0 ? (since_start * 1000.0) / since_start_ms : 0.0;
 }
 
 bool ProgressTracker::should_trigger_callback() {

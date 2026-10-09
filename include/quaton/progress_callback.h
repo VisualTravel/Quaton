@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -93,6 +94,37 @@ struct FileProcessStatus {
 };
 
 /**
+ * @class DecompressionMeter
+ * @brief Process-wide count of the bytes this library has decompressed
+ *
+ * Decompression happens deep inside the download and patch workers, which have
+ * no tracker to report to, so the byte count is kept here and sampled by the
+ * ProgressTracker that produces the progress snapshots.
+ */
+class DecompressionMeter {
+ public:
+  /**
+   * @brief The meter shared by every thread and session of the process
+   */
+  static DecompressionMeter& instance();
+
+  /**
+   * @brief Add decompressed payload bytes, callable from any thread
+   */
+  void AddBytes(int64_t bytes) noexcept;
+
+  /**
+   * @brief Total payload bytes decompressed since the process started
+   */
+  int64_t TotalBytes() const noexcept;
+
+ private:
+  DecompressionMeter() = default;
+
+  std::atomic<int64_t> total_bytes_{0};
+};
+
+/**
  * @struct ProgressInfo
  * @brief Unified progress information structure
  */
@@ -111,9 +143,11 @@ struct ProgressInfo {
   int failed_files;     ///< Number of failed files
 
   // Download statistics
-  double download_speed;            ///< Download speed (MB/s)
-  double estimated_seconds;         ///< Estimated remaining time (seconds)
-  int estimated_minutes;            ///< Estimated remaining time (minutes)
+  double download_speed;       ///< Download speed (MB/s)
+  double decompression_speed;  ///< Decompression speed (MB/s)
+  int64_t decompressed_bytes;  ///< Payload bytes decompressed (process wide)
+  double estimated_seconds;    ///< Estimated remaining time (seconds)
+  int estimated_minutes;       ///< Estimated remaining time (minutes)
   int estimated_remaining_seconds;  ///< Remaining seconds after minutes
 
   // Operation context
@@ -126,6 +160,8 @@ struct ProgressInfo {
         remaining_files(0),
         failed_files(0),
         download_speed(0.0),
+        decompression_speed(0.0),
+        decompressed_bytes(0),
         estimated_seconds(0.0),
         estimated_minutes(0),
         estimated_remaining_seconds(0),
@@ -220,6 +256,12 @@ class ProgressTracker {
   bool should_trigger_callback();
 
   /**
+   * @brief Sample the decompression meter and derive the current speed
+   * @return Bytes decompressed per second over the last sampling window
+   */
+  double sample_decompression_speed() const;
+
+  /**
    * @brief Trigger callback if conditions are met
    */
   void trigger_callback_if_ready();
@@ -251,6 +293,18 @@ class ProgressTracker {
   int64_t last_bytes_downloaded_;
   std::chrono::steady_clock::time_point last_speed_update_;
   double current_speed_;  ///< Bytes per second
+
+  // Decompression speed tracking, sampled from DecompressionMeter. Mutable
+  // because a snapshot is produced from get_progress(), which is const.
+  mutable std::mutex decompression_mutex_;
+  mutable int64_t start_decompressed_bytes_;  ///< Meter total at start
+  mutable int64_t last_decompressed_bytes_;
+  mutable std::chrono::steady_clock::time_point decompression_start_;
+  mutable std::chrono::steady_clock::time_point last_decompression_update_;
+  mutable double decompression_speed_;  ///< Bytes per second
+  /// A full sampling window has closed, so decompression_speed_ is measured
+  /// rather than averaged over the whole session.
+  mutable bool decompression_window_closed_ = false;
 };
 
 }  // namespace Quaton

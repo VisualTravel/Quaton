@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "quaton/logger.h"
+#include "quaton/progress_callback.h"
 #include "quaton/utils/path_helper.h"
 
 QUATON_NAMESPACE_BEGIN
@@ -48,6 +49,8 @@ std::vector<uint8_t> CompressionUtils::DecompressZstd(
   }
 
   decompressed_data.resize(actual_size);
+  DecompressionMeter::instance().AddBytes(
+      static_cast<int64_t>(decompressed_data.size()));
   LOG_INFO("Decompressed data, size: %zu bytes", actual_size);
 
   // Save decompressed file

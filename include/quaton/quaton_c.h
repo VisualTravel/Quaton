@@ -165,6 +165,16 @@ typedef void(QUATON_C_CALL* quaton_progress_callback_c)(
  *        current_manifest_url and chunk_base_url, and accept max_issues
  *        (verify only, default 5000, 0 collects every failing file).
  *
+ *        Queuing several packages: category_ids (an array) replaces
+ *        category_id and makes the session work through those categories one
+ *        after another, in the given order, reporting their combined progress
+ *        (see quaton_download_status_c). "auto", "patch", "verify" and
+ *        "restore" accept a list; "chunk" takes explicit manifest URLs and
+ *        stays single category. Every category is validated against the index
+ *        before the first transfer, a failure stops the queue and names the
+ *        category in the session message, and a cancelled queue marks the rest
+ *        of the categories "pending".
+ *
  *        Nothing is compared against local records: the published manifest is
  *        the only reference, so a tree that this library never downloaded, or
  *        one whose records were removed, is checked just as well. filter is
@@ -187,6 +197,46 @@ quaton_download_start_c(const char* request_json,
 /**
  * @brief Session state and last reported progress as JSON.
  *
+ *   {"session_id":1,"state":"running","finished":false,"result_code":0,
+ *    "message":"",
+ *    "progress":{"mode":"chunk_download","session_mode":"auto",
+ *                "percent":0.42,"current_file":"avatar/x.json",
+ *                "current_category_id":"textures_hk4e","category_index":2,
+ *                "category_count":3,"total_files":13426,
+ *                "completed_files":5640,"remaining_files":7786,
+ *                "failed_files":0,"speed_mbps":12.5,
+ *                "decompress_speed":38.2,"decompressed_bytes":1048576,
+ *                "eta_seconds":154.0,
+ *                "stages":{"download_initiated":true,...},
+ *                "categories":[{"category_id":"game_data_hk4e",
+ *                               "state":"succeeded","percent":1.0,
+ *                               "total_files":6317,"completed_files":6317,
+ *                               "install_size":120397155,
+ *                               "download_size":25585068,
+ *                               "current_file":""}, ...]}}
+ *
+ * For a session that names categories, percent, total_files,
+ * completed_files and remaining_files cover all of them, weighted by the
+ * sizes the index publishes, while current_file, mode and stages belong to the
+ * category that is running now. current_category_id, category_index (1 based)
+ * and category_count say which one that is, and categories[] carries the
+ * per-category state ("pending", "running", "succeeded", "failed",
+ * "cancelled") with its own counters, so a host can show both a total bar and
+ * the package currently being processed. session_mode is the mode the request
+ * asked for, while mode is what the running category is doing.
+ *
+ * install_size and download_size are the sizes the index publishes and are what
+ * the totals are weighted by; they stay 0 when a session works from explicit
+ * manifest URLs instead of an index entry, and the file counts are used as
+ * weights then. A session publishes one last snapshot when it finishes, so a
+ * host that only polls at the end still sees the state it ended in (including a
+ * category that stopped on an error) even if no progress callback ever fired.
+ *
+ * decompress_speed is the payload decompression throughput in MB/s and
+ * decompressed_bytes the amount decompressed since the process started; both
+ * cover the whole process, because the library decompresses deep inside its
+ * workers. They stay 0 for operations that decompress nothing.
+ *
  * @return Length of the JSON result excluding NUL, negative on failure
  */
 QUATON_C_API int32_t quaton_download_status_c(int64_t session_id,
@@ -196,7 +246,7 @@ QUATON_C_API int32_t quaton_download_status_c(int64_t session_id,
 /**
  * @brief Structured result of a finished session as JSON.
  *
- * Only "verify" produces one:
+ * Only "verify" produces one. For a single category:
  *
  *   {"mode":"verify","install_dir":"...","total_files":6317,
  *    "valid_files":6313,"missing_files":3,"corrupted_files":1,
@@ -211,6 +261,16 @@ QUATON_C_API int32_t quaton_download_status_c(int64_t session_id,
  * max_issues, and issues_truncated says whether it was. A "warnings" array is
  * added when no file matched at all, which usually means install_dir holds
  * another build.
+ *
+ * A verify over several categories carries one report per category plus the
+ * totals:
+ *
+ *   {"mode":"verify","install_dir":"...","category_count":3,
+ *    "total_files":13426,"valid_files":13400,"missing_files":26,
+ *    "corrupted_files":0,"missing_bytes":...,
+ *    "issues_truncated":false,
+ *    "categories":[{"category_id":"game_data_hk4e","total_files":6317,
+ *                   "valid_files":6317,...,"issues":[...]}, ...]}
  *
  * A session that failed or was cancelled publishes no report and returns {}.
  * Every other mode returns an empty object too.

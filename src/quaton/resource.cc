@@ -16,6 +16,7 @@
 #include "quaton/configuration/configuration.h"
 #include "quaton/logger.h"
 #include "quaton/manifest/chunk_manifest_pair.h"
+#include "quaton/progress_callback.h"
 #include "quaton/url.h"
 #include "quaton/utils/checksum.h"
 #include "quaton/utils/md5.h"
@@ -303,6 +304,8 @@ void Resource::execute_chunk_write(
       }
 
       decompressed_data.resize(decompressed_size);
+      DecompressionMeter::instance().AddBytes(
+          static_cast<int64_t>(decompressed_size));
     } else {
       decompressed_data.assign(compressed_begin,
                                compressed_begin + compressed_size);
@@ -497,6 +500,8 @@ void Resource::execute_chunk_update(
       }
 
       decompressed_data.resize(decompressed_size);
+      DecompressionMeter::instance().AddBytes(
+          static_cast<int64_t>(decompressed_size));
     } else {
       decompressed_data.assign(compressed_begin,
                                compressed_begin + compressed_size);
@@ -646,6 +651,8 @@ Resource::ChunkPayload Resource::fetch_and_validate_chunk(
       }
 
       payload.decompressed_payload.resize(decompressed_size);
+      DecompressionMeter::instance().AddBytes(
+          static_cast<int64_t>(decompressed_size));
     } else {
       payload.decompressed_payload = payload.compressed_payload;
     }

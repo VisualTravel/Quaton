@@ -5,6 +5,7 @@
 
 #include "quaton/quaton_c.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -435,6 +436,8 @@ json IndexToJson(const IndexInfo& index) {
 
 enum SessionState { kRunning = 0, kSucceeded = 1, kFailed = 2, kCancelled = 3 };
 
+class ProgressAggregator;  // defined with the progress plumbing below
+
 const char* StateName(int state) {
   switch (state) {
     case kSucceeded:
@@ -454,14 +457,21 @@ struct Session {
   std::atomic<int> result_code{0};
   std::atomic<bool> cancel_requested{false};
 
-  std::mutex mutex;  // guards message, progress, result, service and cancel
+  // guards message, progress, last_progress, result, service and cancel
+  std::mutex mutex;
   std::string message;
   json progress = json::object();
+  // Last sample a worker reported, kept so the closing snapshot of a session
+  // describes the run that just happened instead of a blank default.
+  Quaton::ProgressInfo last_progress;
   json result = json::object();
   std::shared_ptr<Quaton::DownloadService> service;
   // Published by the workers that scan the disk, because those go through
   // neither the scheduler nor a session cancel flag of their own.
   std::shared_ptr<std::atomic<bool>> cancel_flag;
+  // Set while a session works through several categories, so that the progress
+  // payload carries their combined view (defined below).
+  std::shared_ptr<ProgressAggregator> aggregator;
 
   std::mutex join_mutex;  // guards worker/joined
   std::thread worker;
@@ -477,13 +487,6 @@ struct Session {
     } else {
       state.store(code == 0 ? kSucceeded : kFailed);
     }
-  }
-
-  void FinishWithError(const std::string& error) {
-    std::lock_guard<std::mutex> lock(mutex);
-    message = error;
-    result_code.store(-1);
-    state.store(cancel_requested.load() ? kCancelled : kFailed);
   }
 };
 
@@ -578,6 +581,8 @@ json ProgressToJson(const Quaton::ProgressInfo& info) {
           {"remaining_files", info.remaining_files},
           {"failed_files", info.failed_files},
           {"speed_mbps", info.download_speed},
+          {"decompress_speed", info.decompression_speed},
+          {"decompressed_bytes", info.decompressed_bytes},
           {"eta_seconds", info.estimated_seconds},
           {"stages",
            {{"download_initiated", status.download_initiated},
@@ -587,15 +592,222 @@ json ProgressToJson(const Quaton::ProgressInfo& info) {
             {"applied", status.applied}}}};
 }
 
+// What one category of a multi-category session is doing.
+enum CategoryState {
+  kCategoryPending = 0,
+  kCategoryRunning = 1,
+  kCategorySucceeded = 2,
+  kCategoryFailed = 3,
+  kCategoryCancelled = 4
+};
+
+const char* CategoryStateName(int state) {
+  switch (state) {
+    case kCategoryRunning:
+      return "running";
+    case kCategorySucceeded:
+      return "succeeded";
+    case kCategoryFailed:
+      return "failed";
+    case kCategoryCancelled:
+      return "cancelled";
+    default:
+      return "pending";
+  }
+}
+
+struct CategoryRun {
+  std::string category_id;
+  int64_t install_size = 0;   ///< Bytes on disk, used to weight the percentages
+  int64_t download_size = 0;  ///< Bytes to transfer
+  int total_files = 0;        ///< File count the index publishes
+  int reported_files = 0;     ///< File count the running service reports
+  int completed_files = 0;
+  double percent = 0.0;  ///< Last percentage the category reported
+  std::string current_file;
+  int state = kCategoryPending;
+};
+
+// Turns the progress of the category that is currently running into the
+// combined progress a host sees, so a queued session can still name the
+// category and the file it is working on.
+class ProgressAggregator {
+ public:
+  ProgressAggregator(std::vector<std::string> category_ids,
+                     std::string session_mode)
+      : session_mode_(std::move(session_mode)) {
+    runs_.reserve(category_ids.size());
+    for (auto& id : category_ids) {
+      CategoryRun run;
+      run.category_id = std::move(id);
+      runs_.push_back(std::move(run));
+    }
+  }
+
+  void SetCategoryInfo(size_t index,
+                       int64_t install_size,
+                       int64_t download_size,
+                       int total_files) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    CategoryRun& run = runs_.at(index);
+    run.install_size = install_size;
+    run.download_size = download_size;
+    run.total_files = total_files;
+  }
+
+  void Begin(size_t index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_ = index;
+    runs_.at(index).state = kCategoryRunning;
+  }
+
+  void Finish(size_t index, int state) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_ = index;
+    CategoryRun& run = runs_.at(index);
+    run.state = state;
+    if (state == kCategorySucceeded) {
+      run.percent = 1.0;
+      run.current_file.clear();
+      run.completed_files = CategoryFileCount(run);
+    }
+  }
+
+  /**
+   * @brief Adds the combined view of every category to one progress payload
+   */
+  json Merge(const json& payload, const Quaton::ProgressInfo& info) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    CategoryRun& active = runs_.at(active_);
+    if (active.state == kCategoryRunning) {
+      active.reported_files = info.total_files;
+      active.completed_files = info.completed_files;
+      active.percent = std::max(0.0, std::min(1.0, info.overall_percentage));
+      active.current_file = info.current_file;
+    }
+
+    int64_t total_weight = 0;
+    double done_weight = 0.0;
+    int64_t remaining_download_bytes = 0;
+    int total_files = 0;
+    int completed_files = 0;
+    json categories = json::array();
+
+    for (const CategoryRun& run : runs_) {
+      // The index knows the size before the category starts, so the weighting
+      // stays stable for the whole session. The file count only stands in when
+      // the index published no size at all; the running count is deliberately
+      // not used, because it would move the total mid-session.
+      int64_t weight = run.install_size;
+      if (weight <= 0) {
+        weight = run.download_size;
+      }
+      if (weight <= 0) {
+        weight = run.total_files;
+      }
+      if (weight <= 0) {
+        weight = 1;
+      }
+
+      const int file_count = CategoryFileCount(run);
+      total_weight += weight;
+      done_weight += static_cast<double>(weight) * run.percent;
+      // The download speed counts transferred (compressed) bytes, so the
+      // estimate is derived from the transfer size, not the installed size.
+      if (run.percent < 1.0 && run.download_size > 0) {
+        remaining_download_bytes += static_cast<int64_t>(
+            static_cast<double>(run.download_size) * (1.0 - run.percent));
+      }
+      total_files += file_count;
+      completed_files += run.completed_files;
+
+      categories.push_back({{"category_id", run.category_id},
+                            {"state", CategoryStateName(run.state)},
+                            {"percent", run.percent},
+                            {"total_files", file_count},
+                            {"completed_files", run.completed_files},
+                            {"install_size", run.install_size},
+                            {"download_size", run.download_size},
+                            {"current_file", run.current_file}});
+    }
+
+    json merged = payload;
+    merged["session_mode"] = session_mode_;
+    merged["percent"] = total_weight > 0
+                            ? done_weight / static_cast<double>(total_weight)
+                            : 0.0;
+    merged["total_files"] = total_files;
+    merged["completed_files"] = completed_files;
+    merged["remaining_files"] = std::max(0, total_files - completed_files);
+    merged["category_count"] = static_cast<int>(runs_.size());
+    merged["category_index"] = static_cast<int>(active_ + 1);
+    merged["current_category_id"] = active.category_id;
+    merged["categories"] = std::move(categories);
+
+    // Chunk downloads report no byte totals, so the estimate is derived from
+    // the transfer sizes the index publishes.
+    const double speed_bytes = info.download_speed * 1024.0 * 1024.0;
+    if (speed_bytes > 0.0 && remaining_download_bytes > 0) {
+      merged["eta_seconds"] = remaining_download_bytes / speed_bytes;
+    }
+    return merged;
+  }
+
+ private:
+  /// Files a category holds: the running count wins over the published one.
+  static int CategoryFileCount(const CategoryRun& run) {
+    return std::max(run.total_files, run.reported_files);
+  }
+
+  const std::string session_mode_;
+  std::mutex mutex_;  // guards runs_ and active_
+  std::vector<CategoryRun> runs_;
+  size_t active_ = 0;
+};
+
+// Keeps the session's aggregator alive for the length of a queued run and
+// clears it on every exit path.
+class AggregatorScope {
+ public:
+  AggregatorScope(const std::shared_ptr<Session>& session,
+                  std::shared_ptr<ProgressAggregator> aggregator)
+      : session_(session) {
+    std::lock_guard<std::mutex> lock(session_->mutex);
+    session_->aggregator = std::move(aggregator);
+  }
+
+  ~AggregatorScope() {
+    std::lock_guard<std::mutex> lock(session_->mutex);
+    session_->aggregator.reset();
+  }
+
+  AggregatorScope(const AggregatorScope&) = delete;
+  AggregatorScope& operator=(const AggregatorScope&) = delete;
+
+ private:
+  std::shared_ptr<Session> session_;
+};
+
 // Called from the library's download threads.
 void ReportProgress(const std::shared_ptr<Session>& session,
                     const Quaton::ProgressInfo& info) {
   json payload = ProgressToJson(info);
+  std::shared_ptr<ProgressAggregator> aggregator;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    aggregator = session->aggregator;
+  }
+  if (aggregator) {
+    payload = aggregator->Merge(payload, info);
+  }
+
   quaton_progress_callback_c callback = nullptr;
   void* user_data = nullptr;
   {
     std::lock_guard<std::mutex> lock(session->mutex);
     session->progress = payload;
+    session->last_progress = info;
     callback = session->callback;
     user_data = session->user_data;
   }
@@ -607,6 +819,19 @@ void ReportProgress(const std::shared_ptr<Session>& session,
     } catch (...) {
     }
   }
+}
+
+// The closing snapshot a session publishes once it is done. It starts from the
+// last sample a worker reported, so a host that polls only at the end still
+// sees the measured speeds and byte counts of the run; a session that never got
+// a callback (a very small package) falls back to the defaults.
+Quaton::ProgressInfo SessionSummary(const std::shared_ptr<Session>& session) {
+  std::lock_guard<std::mutex> lock(session->mutex);
+  Quaton::ProgressInfo info;
+  info = session->last_progress;
+  // The session is over, so no file is being worked on any more.
+  info.current_file.clear();
+  return info;
 }
 
 // Holds the running service for the duration of a download. The progress
@@ -649,6 +874,40 @@ std::string RequestInstallDir(const json& request) {
     install_dir = GetString(request, "output_dir");
   }
   return install_dir;
+}
+
+// Reads the categories a request works on: category_ids (array) wins over the
+// single category_id, and the request is normalised so that one category keeps
+// behaving exactly as it did before.
+std::vector<std::string> RequestCategoryIds(json* request) {
+  std::vector<std::string> ids;
+  const auto it = request->find("category_ids");
+  if (it != request->end() && it->is_array()) {
+    for (const auto& entry : *it) {
+      if (!entry.is_string()) {
+        continue;
+      }
+      const std::string id = entry.get<std::string>();
+      if (!id.empty() && std::find(ids.begin(), ids.end(), id) == ids.end()) {
+        ids.push_back(id);
+      }
+    }
+  }
+  if (ids.empty()) {
+    const std::string single = GetString(*request, "category_id");
+    if (!single.empty()) {
+      ids.push_back(single);
+    }
+    return ids;
+  }
+  (*request)["category_id"] = ids.size() == 1 ? ids.front() : std::string();
+  return ids;
+}
+
+// The version a patch update is built from; a host may name it either way.
+std::string RequestSourceVersion(const json& request) {
+  return GetString(
+      request, "source_version", GetString(request, "previous_tag"));
 }
 
 // Verification and repair read a tree that a download already installed, so a
@@ -877,8 +1136,8 @@ int RunChunkVerify(const std::shared_ptr<Session>& session,
   }
   report.max_issues = static_cast<size_t>(max_issues);
 
-  if (!service->Verify(manifest_pair, install_dir, &report,
-                       PublishCancelFlag(session))) {
+  if (!service->Verify(
+          manifest_pair, install_dir, &report, PublishCancelFlag(session))) {
     if (report.cancelled) {
       // A cancelled scan has no report to publish and must not surface as a
       // failure with a misleading reason.
@@ -892,8 +1151,8 @@ int RunChunkVerify(const std::shared_ptr<Session>& session,
 
   {
     std::lock_guard<std::mutex> lock(session->mutex);
-    session->result = VerifyReportToJson(report, install_dir,
-                                         GetString(request, "category_id"));
+    session->result = VerifyReportToJson(
+        report, install_dir, GetString(request, "category_id"));
   }
   return 0;
 }
@@ -935,11 +1194,12 @@ int RunRestore(const std::shared_ptr<Session>& session,
   // are recorded under the same name.
   const std::string package = GetString(request, "filter");
   const auto cancel_flag = PublishCancelFlag(session);
-  const int code =
-      service
-          ->Restore(manifest_pair, install_dir,
-                    package.empty() ? "game" : package, cancel_flag)
-          .get();
+  const int code = service
+                       ->Restore(manifest_pair,
+                                 install_dir,
+                                 package.empty() ? "game" : package,
+                                 cancel_flag)
+                       .get();
   if (code != 0) {
     if (cancel_flag->load()) {
       session->cancel_requested.store(true);
@@ -1080,7 +1340,7 @@ int RunPatchDownload(const std::shared_ptr<Session>& session,
 bool BuildAutoRequest(const json& request, json* resolved, std::string* error) {
   const std::string api_base_url = GetString(request, "api_base_url");
   const std::string category_id = GetString(request, "category_id");
-  const std::string previous_tag = GetString(request, "previous_tag");
+  const std::string previous_tag = RequestSourceVersion(request);
   if (api_base_url.empty() || category_id.empty()) {
     *error = "auto mode requires api_base_url and category_id";
     return false;
@@ -1120,36 +1380,329 @@ bool BuildAutoRequest(const json& request, json* resolved, std::string* error) {
   return true;
 }
 
+// Fills in everything one category of a queued session needs, from an index
+// that was already fetched, so the queue does not query the index once per
+// category and the workers never fall back to a second lookup.
+bool ResolveUnitRequest(const json& request,
+                        const IndexInfo& index,
+                        const CategoryInfo& category,
+                        const std::string& mode,
+                        json* unit,
+                        std::string* error) {
+  *unit = request;
+  (*unit)["category_id"] = category.category_id;
+  (*unit)["tag"] = index.tag;
+
+  if (mode == "verify" || mode == "restore") {
+    (*unit)["current_manifest_url"] = category.manifest_url;
+    (*unit)["chunk_base_url"] = category.chunk_url_prefix;
+    return true;
+  }
+
+  const std::string previous_tag = RequestSourceVersion(request);
+  const bool wants_patch =
+      mode == "patch" || (mode == "auto" && category.patch_available &&
+                          GetBool(request, "prefer_patch", true));
+  if (!wants_patch) {
+    (*unit)["mode"] = "chunk";
+    (*unit)["previous_manifest_url"] = std::string();
+    (*unit)["current_manifest_url"] = category.manifest_url;
+    (*unit)["chunk_base_url"] = category.chunk_url_prefix;
+    return true;
+  }
+
+  if (!category.patch_available) {
+    *error = "no patch set for source version: " + previous_tag;
+    return false;
+  }
+  (*unit)["mode"] = "patch";
+  (*unit)["source_version"] = previous_tag;
+  (*unit)["previous_tag"] = previous_tag;
+  (*unit)["patch_manifest_url"] = category.patch_manifest_url;
+  (*unit)["patch_manifest_id"] = category.patch_manifest_id;
+  (*unit)["patch_manifest_md5"] = category.patch_manifest_checksum;
+  (*unit)["patch_url_prefix"] = category.patch_url_prefix;
+  (*unit)["package_name"] = category.category_id;
+  return true;
+}
+
+bool IsKnownQueueMode(const std::string& mode) {
+  return mode == "auto" || mode == "patch" || mode == "verify" ||
+         mode == "restore";
+}
+
+/// Operation the first category of a queue starts with, used for the snapshot
+/// published before any transfer begins.
+Quaton::OperationMode QueueOperationMode(const std::string& mode) {
+  if (mode == "patch") {
+    return Quaton::OperationMode::kPatchUpdate;
+  }
+  if (mode == "verify" || mode == "restore") {
+    return Quaton::OperationMode::kChunkVerify;
+  }
+  return Quaton::OperationMode::kChunkDownload;
+}
+
+// Runs the categories one after another inside a single session and reports
+// their combined progress. Sequential is deliberate: the caller asked for one
+// total progress over one install directory, and a host that wants transfers
+// in parallel can still start several sessions.
+int RunCategoryQueue(const std::shared_ptr<Session>& session,
+                     const json& request,
+                     const std::string& mode,
+                     const std::vector<std::string>& category_ids,
+                     std::string* error) {
+  const std::string api_base_url = GetString(request, "api_base_url");
+  if (api_base_url.empty()) {
+    *error = mode + " mode with several categories requires api_base_url";
+    return -1;
+  }
+
+  IndexInfo index;
+  if (!QueryIndex(api_base_url,
+                  GetString(request, "branch", "main"),
+                  GetString(request, "tag"),
+                  RequestSourceVersion(request),
+                  &index,
+                  error)) {
+    return -1;
+  }
+  // Every category is checked before the first byte is transferred, so a typo
+  // cannot leave a half updated installation behind.
+  for (const std::string& category_id : category_ids) {
+    if (index.Find(category_id) == nullptr) {
+      *error = "category not present in the index: " + category_id;
+      return -1;
+    }
+  }
+
+  auto aggregator = std::make_shared<ProgressAggregator>(category_ids, mode);
+  for (size_t i = 0; i < category_ids.size(); ++i) {
+    const CategoryInfo* category = index.Find(category_ids[i]);
+    aggregator->SetCategoryInfo(i,
+                                category->uncompressed_size,
+                                category->compressed_size,
+                                category->file_count);
+  }
+  AggregatorScope scope(session, aggregator);
+
+  // Publish the queue itself before the first transfer, so a host can show
+  // "1/7 bhyp" without waiting for a progress callback of the first category.
+  aggregator->Begin(0);
+  {
+    Quaton::ProgressInfo initial;
+    initial.operation_mode = QueueOperationMode(mode);
+    ReportProgress(session, initial);
+  }
+
+  const auto clear_result = [&session]() {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->result = json::object();
+  };
+  clear_result();
+
+  // The mode the last category actually ran, so an "auto" queue that turned
+  // into a patch update reports that rather than a plain download.
+  std::string unit_mode = mode;
+  // One last snapshot per exit path, so what the host polls describes the state
+  // the session ended in, including a category that stopped on an error or
+  // never got a progress callback of its own.
+  const auto publish_summary = [&session, &unit_mode]() {
+    Quaton::ProgressInfo done = SessionSummary(session);
+    done.operation_mode = QueueOperationMode(unit_mode);
+    ReportProgress(session, done);
+  };
+  const auto clear_queue_result =
+      [&session, &clear_result, &publish_summary]() {
+        clear_result();
+        publish_summary();
+      };
+
+  json reports = json::array();
+  for (size_t i = 0; i < category_ids.size(); ++i) {
+    if (session->cancel_requested.load()) {
+      aggregator->Finish(i, kCategoryCancelled);
+      clear_queue_result();
+      *error = "cancelled";
+      return -1;
+    }
+    aggregator->Begin(i);
+
+    json unit;
+    if (!ResolveUnitRequest(
+            request, index, *index.Find(category_ids[i]), mode, &unit, error)) {
+      aggregator->Finish(i, kCategoryFailed);
+      clear_queue_result();
+      return -1;
+    }
+
+    unit_mode = mode == "auto" ? GetString(unit, "mode", "chunk") : mode;
+    std::string unit_error;
+    int unit_code = -1;
+    if (unit_mode == "patch") {
+      unit_code = RunPatchDownload(session, unit, &unit_error);
+    } else if (unit_mode == "chunk") {
+      unit_code = RunChunkDownload(session, unit, &unit_error);
+    } else if (unit_mode == "verify") {
+      unit_code = RunChunkVerify(session, unit, &unit_error);
+    } else if (unit_mode == "restore") {
+      unit_code = RunRestore(session, unit, &unit_error);
+    } else {
+      unit_error = "unsupported mode: " + unit_mode;
+    }
+
+    if (unit_code != 0) {
+      aggregator->Finish(i,
+                         session->cancel_requested.load() ? kCategoryCancelled
+                                                          : kCategoryFailed);
+      clear_queue_result();
+      *error = "category " + category_ids[i] + ": " +
+               (unit_error.empty() ? "failed" : unit_error);
+      return unit_code;
+    }
+    aggregator->Finish(i, kCategorySucceeded);
+
+    if (unit_mode == "verify") {
+      json report;
+      {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        report = session->result;
+      }
+      report["category_id"] = category_ids[i];
+      reports.push_back(std::move(report));
+    }
+  }
+
+  if (mode == "verify") {
+    // One report per category plus the totals a caller wants at a glance.
+    json merged = {{"mode", "verify"},
+                   {"install_dir", RequestInstallDir(request)},
+                   {"category_count", static_cast<int>(category_ids.size())},
+                   {"categories", std::move(reports)}};
+    bool truncated = false;
+    for (const char* key : {"total_files",
+                            "valid_files",
+                            "missing_files",
+                            "corrupted_files",
+                            "missing_bytes",
+                            "corrupted_bytes"}) {
+      int64_t sum = 0;
+      for (const auto& report : merged["categories"]) {
+        sum += report.value(key, int64_t{0});
+      }
+      merged[key] = sum;
+    }
+    for (const auto& report : merged["categories"]) {
+      truncated = truncated || report.value("issues_truncated", false);
+    }
+    merged["issues_truncated"] = truncated;
+    if (merged["total_files"].get<int64_t>() > 0 &&
+        merged["valid_files"].get<int64_t>() == 0) {
+      merged["warnings"] = json::array(
+          {"no file matched the manifests: install_dir does not hold the files "
+           "they describe"});
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->result = std::move(merged);
+  }
+
+  // One last snapshot, so a category that finished without a single progress
+  // callback still shows up as done in what the host polls.
+  publish_summary();
+  return 0;
+}
+
+// Runs the single category a request names (or none, when the request carries
+// explicit manifest URLs). An aggregator with one entry keeps the progress
+// payload shaped the same as a queued session.
+int RunSingleCategory(const std::shared_ptr<Session>& session,
+                      const json& request,
+                      const std::string& mode,
+                      const std::vector<std::string>& category_ids,
+                      std::string* error) {
+  auto aggregator = category_ids.empty() ? nullptr
+                                         : std::make_shared<ProgressAggregator>(
+                                               category_ids, mode);
+  AggregatorScope scope(session, aggregator);
+  if (aggregator) {
+    aggregator->Begin(0);
+  }
+
+  // The mode the session actually resolved to, which is what the closing
+  // snapshot publishes.
+  std::string resolved_mode = mode;
+  const auto publish_summary = [&session, &resolved_mode]() {
+    Quaton::ProgressInfo done = SessionSummary(session);
+    done.operation_mode = QueueOperationMode(resolved_mode);
+    ReportProgress(session, done);
+  };
+
+  json resolved = request;
+  if (mode == "auto") {
+    if (!BuildAutoRequest(request, &resolved, error)) {
+      if (aggregator) {
+        aggregator->Finish(0, kCategoryFailed);
+      }
+      publish_summary();
+      return -1;
+    }
+    resolved_mode = GetString(resolved, "mode", "chunk");
+  }
+
+  if (session->cancel_requested.load()) {
+    if (aggregator) {
+      aggregator->Finish(0, kCategoryCancelled);
+    }
+    *error = "cancelled";
+    publish_summary();
+    return -1;
+  }
+
+  int code = -1;
+  if (resolved_mode == "patch") {
+    code = RunPatchDownload(session, resolved, error);
+  } else if (resolved_mode == "chunk") {
+    code = RunChunkDownload(session, resolved, error);
+  } else if (resolved_mode == "verify") {
+    code = RunChunkVerify(session, resolved, error);
+  } else if (resolved_mode == "restore") {
+    code = RunRestore(session, resolved, error);
+  } else {
+    *error = "unsupported mode: " + resolved_mode;
+  }
+
+  if (aggregator) {
+    aggregator->Finish(
+        0,
+        code == 0 ? kCategorySucceeded
+                  : (session->cancel_requested.load() ? kCategoryCancelled
+                                                      : kCategoryFailed));
+  }
+  // One last snapshot, so a package that finished without a single progress
+  // callback still shows up as done in what the host polls.
+  publish_summary();
+  return code;
+}
+
 void RunSession(const std::shared_ptr<Session>& session, json request) {
   int code = -1;
   std::string error;
   try {
-    std::string mode = GetString(request, "mode", "auto");
-    if (mode == "auto") {
-      json resolved;
-      if (!BuildAutoRequest(request, &resolved, &error)) {
-        session->FinishWithError(error);
-        return;
+    const std::string mode = GetString(request, "mode", "auto");
+    const std::vector<std::string> category_ids = RequestCategoryIds(&request);
+
+    if (category_ids.size() > 1) {
+      if (mode == "chunk") {
+        error =
+            "chunk mode downloads explicit manifest URLs and takes one "
+            "category; use auto or patch to queue several";
+      } else if (!IsKnownQueueMode(mode)) {
+        error = "unsupported mode: " + mode;
+      } else {
+        code = RunCategoryQueue(session, request, mode, category_ids, &error);
       }
-      request = std::move(resolved);
-      mode = GetString(request, "mode", "chunk");
-    }
-
-    if (session->cancel_requested.load()) {
-      session->Finish(-1);
-      return;
-    }
-
-    if (mode == "patch") {
-      code = RunPatchDownload(session, request, &error);
-    } else if (mode == "chunk") {
-      code = RunChunkDownload(session, request, &error);
-    } else if (mode == "verify") {
-      code = RunChunkVerify(session, request, &error);
-    } else if (mode == "restore") {
-      code = RunRestore(session, request, &error);
     } else {
-      error = "unsupported mode: " + mode;
+      code = RunSingleCategory(session, request, mode, category_ids, &error);
     }
   } catch (const std::exception& e) {
     error = std::string("download failed: ") + e.what();
@@ -1391,7 +1944,8 @@ int32_t quaton_download_result_c(int64_t session_id,
           return Fail("unknown session: " + std::to_string(session_id));
         }
         if (session->state.load() == kRunning) {
-          return Fail("session is still running: " + std::to_string(session_id));
+          return Fail("session is still running: " +
+                      std::to_string(session_id));
         }
 
         json result;
