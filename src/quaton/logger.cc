@@ -8,7 +8,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <future>
 #include <iomanip>
 #include <mutex>
 #include <queue>
@@ -42,10 +41,20 @@ class Logger::LoggerImpl {
 
   bool initialize() {
     std::lock_guard<std::mutex> lock(mutex);
+    // Idempotent: a second call must not start a second worker thread.
+    if (initialized.load()) {
+      return true;
+    }
     if (!initFileLogger()) {
       return false;
     }
-    initialized = true;
+    initialized.store(true);
+
+    // The worker is started here, under the same lock that stops it, so a
+    // shutdown can never race with a lazy start and leave an unjoined thread
+    // (or an unreachable worker) behind.
+    logWorkerThread = std::thread([this]() { this->processLogQueue(); });
+
     logFile << "\n\n\n\n\n";
     logFile << "//////////////////// Quaton Started ////////////////////"
             << std::endl;
@@ -64,8 +73,9 @@ class Logger::LoggerImpl {
   bool initFileLogger() {
     logDirectory = Quaton::PathHelper::GetLogsDir();
 
-    if (!std::filesystem::exists(logDirectory)) {
-      std::filesystem::create_directories(logDirectory);
+    std::error_code error;
+    if (!std::filesystem::exists(logDirectory, error)) {
+      std::filesystem::create_directories(logDirectory, error);
     }
 
     logFilename = logDirectory + "/" + lastLogFilename;
@@ -74,9 +84,8 @@ class Logger::LoggerImpl {
       return false;
     }
 
-    if (std::filesystem::exists(logFilename)) {
-      currentFileSize = std::filesystem::file_size(logFilename);
-    } else {
+    currentFileSize = std::filesystem::file_size(logFilename, error);
+    if (error) {
       currentFileSize = 0;
     }
     return true;
@@ -91,7 +100,7 @@ class Logger::LoggerImpl {
       return;
     }
 
-    if (level < minLogLevel) {
+    if (level < minLogLevel.load()) {
       return;
     }
 
@@ -102,43 +111,58 @@ class Logger::LoggerImpl {
     asyncLog(level, formattedMessage);
   }
 
-  void asyncLog(LogLevel level, const std::string& message) {
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      logQueue.push(message);
-      if (logQueue.size() >= 16) {
-        logCondition.notify_one();
-      }
+  void asyncLog(LogLevel level, std::string message) {
+    std::lock_guard<std::mutex> lock(mutex);
+    const bool was_empty = logQueue.empty();
+    logQueue.push(std::move(message));
+    // Wake the worker for the first message of a batch as well, otherwise a
+    // short burst could sit unflushed until the queue fills up.
+    if (was_empty || logQueue.size() >= 16) {
+      logCondition.notify_one();
     }
-    std::call_once(workerThreadFlag, [this]() {
-      logWorkerThread = std::thread([this]() { this->processLogQueue(); });
-    });
   }
 
   void processLogQueue() {
-    while (initialized) {
+    while (true) {
       std::unique_lock<std::mutex> lock(mutex);
       logCondition.wait(lock,
                         [this]() { return !logQueue.empty() || !initialized; });
-
-      std::vector<std::string> batch;
-      while (!logQueue.empty() && batch.size() < 32) {
-        batch.push_back(std::move(logQueue.front()));
-        logQueue.pop();
+      if (!initialized) {
+        break;
       }
-      lock.unlock();
 
-      if (logFile.is_open()) {
-        for (const auto& logMessage : batch) {
-          if (currentFileSize >= maxFileSize) {
-            saveLog();
-          }
-          logFile << logMessage << std::endl;
-          currentFileSize += logMessage.size() + 1;
+      // Everything below runs under the lock - logFile and currentFileSize are
+      // only ever touched under it, which is also why the rotation goes through
+      // saveLogLocked() instead of the public saveLog() - and inside a
+      // catch-all, because an exception escaping this thread would terminate
+      // the host process.
+      try {
+        std::vector<std::string> batch;
+        while (!logQueue.empty() && batch.size() < 32) {
+          batch.push_back(std::move(logQueue.front()));
+          logQueue.pop();
         }
-        logFile.flush();
+
+        // A failed rotation can leave the stream closed; retry the reopen here
+        // so logging recovers instead of staying silent forever.
+        if (!logFile.is_open()) {
+          logFile.clear();
+          logFile.open(logFilename, std::ios::app);
+        }
+
+        if (logFile.is_open()) {
+          for (const auto& logMessage : batch) {
+            if (currentFileSize >= maxFileSize) {
+              saveLogLocked();
+            }
+            logFile << logMessage << std::endl;
+            currentFileSize += logMessage.size() + 1;
+          }
+          logFile.flush();
+        }
+      } catch (...) {
+        // Drop the batch and keep serving later messages.
       }
-      lock.lock();
     }
   }
 
@@ -146,12 +170,19 @@ class Logger::LoggerImpl {
                                const char* file,
                                int line,
                                const std::string& message) {
+    // Plain string handling: this runs on the caller's thread, which may be
+    // outside any try/catch, so no throwing filesystem call belongs here.
+    const std::string file_path = (file == nullptr) ? "" : file;
+    const size_t separator = file_path.find_last_of("/\\");
+    const std::string file_name = (separator == std::string::npos)
+                                      ? file_path
+                                      : file_path.substr(separator + 1);
+
     std::stringstream ss;
     ss << "[" << getCurrentTimestamp() << "]"
        << "[" << getThreadId() << "]"
        << "[" << getLogLevelString(level) << "]"
-       << "[" << std::filesystem::path(file).filename().string() << ":" << line
-       << "] " << message;
+       << "[" << file_name << ":" << line << "] " << message;
     return ss.str();
   }
 
@@ -207,35 +238,69 @@ class Logger::LoggerImpl {
   }
 
   void saveLog() {
-    std::string newFilename;
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (logFile.is_open()) {
-        logFile.close();
-        newFilename = logDirectory + "/" + generateLogFilenameUnsafe();
-        std::filesystem::rename(logFilename, newFilename);
-        logFile.open(logFilename, std::ios::app);
-        if (logFile.is_open()) {
-          currentFileSize = std::filesystem::file_size(logFilename);
-        } else {
-          currentFileSize = 0;
-        }
-      }
+    std::lock_guard<std::mutex> lock(mutex);
+    saveLogLocked();
+  }
+
+  // Rotates the log file. The caller must hold mutex.
+  void saveLogLocked() {
+    if (!logFile.is_open()) {
+      return;
+    }
+
+    logFile.close();
+    const std::string newFilename =
+        logDirectory + "/" + generateLogFilenameUnsafe();
+
+    // Rotation is best effort: the rename fails while another process still
+    // holds the log file, and throwing here would kill the log worker thread
+    // (and with it the whole process).
+    std::error_code error;
+    std::filesystem::rename(logFilename, newFilename, error);
+
+    logFile.clear();
+    logFile.open(logFilename, std::ios::app);
+    if (!logFile.is_open()) {
+      // The worker reopens the stream before the next batch, so only reset the
+      // counter here instead of leaving the rotation armed.
+      currentFileSize = 0;
+      return;
+    }
+
+    if (error) {
+      // Keep appending to the current file and only retry the rotation after
+      // another full file worth of output, so a locked log file cannot turn
+      // into a rename loop.
+      currentFileSize = 0;
+      return;
+    }
+
+    std::error_code size_error;
+    currentFileSize = std::filesystem::file_size(logFilename, size_error);
+    if (size_error) {
+      currentFileSize = 0;
     }
   }
 
   std::string generateLogFilenameUnsafe() {
+    // Length of the "quaton." prefix that the rotated files share.
+    static constexpr size_t kPrefixLength = 7;
     if (currentLogIndex == 0) {
       int maxIndex = 0;
-      if (std::filesystem::exists(logDirectory)) {
-        for (const auto& entry :
-             std::filesystem::directory_iterator(logDirectory)) {
-          std::string filename = entry.path().filename().string();
+      std::error_code error;
+      // Enumeration is best effort; an unreadable directory must not abort the
+      // rotation, so failures simply fall back to index 1.
+      try {
+        for (std::filesystem::directory_iterator it(logDirectory, error), last;
+             !error && it != last;
+             it.increment(error)) {
+          const std::string filename = it->path().filename().string();
           if (filename.rfind("quaton.", 0) == 0 && filename != "quaton.log") {
             try {
-              size_t dotPos = filename.find('.', 4);
-              if (dotPos != std::string::npos) {
-                int num = std::stoi(filename.substr(4, dotPos - 4));
+              const size_t dotPos = filename.find('.', kPrefixLength);
+              if (dotPos != std::string::npos && dotPos > kPrefixLength) {
+                const int num = std::stoi(
+                    filename.substr(kPrefixLength, dotPos - kPrefixLength));
                 maxIndex = std::max(maxIndex, num);
               }
             } catch (...) {
@@ -243,6 +308,8 @@ class Logger::LoggerImpl {
             }
           }
         }
+      } catch (...) {
+        maxIndex = 0;
       }
       currentLogIndex = maxIndex + 1;
     }
@@ -250,29 +317,47 @@ class Logger::LoggerImpl {
   }
 
   void exitFileLogger() {
-    if (initialized) {
-      initialized = false;
-      logCondition.notify_all();
+    // The stop flag must be changed while holding the lock the worker waits on,
+    // otherwise the notification can be lost and the join below would hang the
+    // process shutdown forever.
+    std::thread worker;
+    bool was_initialized = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      was_initialized = initialized.load();
+      initialized.store(false);
+      // Take the handle under the lock so the join cannot race with the start
+      // in initialize().
+      worker = std::move(logWorkerThread);
+    }
+    if (!was_initialized) {
+      return;
+    }
 
-      if (logWorkerThread.joinable()) {
-        logWorkerThread.join();
-      }
+    logCondition.notify_all();
 
-      if (logFile.is_open()) {
-        logFile.flush();
-        logFile.close();
-      }
+    if (worker.joinable()) {
+      worker.join();
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (logFile.is_open()) {
+      logFile.flush();
+      logFile.close();
     }
   }
 
   void exitLogs() {
-    if (logFile.is_open()) {
-      logFile << "//////////////////// Log End ////////////////////"
-              << std::endl;
-      logFile << "\n\n\n\n\n";
-      logFile.flush();
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (logFile.is_open()) {
+        logFile << "//////////////////// Log End ////////////////////"
+                << std::endl;
+        logFile << "\n\n\n\n\n";
+        logFile.flush();
+      }
+      saveLogLocked();
     }
-    saveLog();
     exitFileLogger();
   }
 
@@ -285,11 +370,12 @@ class Logger::LoggerImpl {
   std::mutex mutex;
   std::condition_variable logCondition;
   std::thread logWorkerThread;
-  std::once_flag workerThreadFlag;
   std::atomic<bool> initialized;
   std::queue<std::string> logQueue;
   std::atomic<int> currentLogIndex;
-  LogLevel minLogLevel;
+  // Read on every log call from any thread, so it is atomic instead of being
+  // read outside the mutex.
+  std::atomic<LogLevel> minLogLevel;
 };
 
 Logger::LoggerImpl* Logger::pImpl = nullptr;
